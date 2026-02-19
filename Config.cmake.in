@@ -1,0 +1,50 @@
+@PACKAGE_INIT@
+
+# Include required CMake modules
+include(CMakeFindDependencyMacro)
+
+# spacetime CMake configuration file
+
+# Provide path information
+set(spacetime_VERSION @PROJECT_VERSION@)
+
+# Check if we're being called from the build tree or install tree
+get_filename_component(spacetime_CMAKE_DIR "${CMAKE_CURRENT_LIST_FILE}" PATH)
+
+# Include directory information
+if(EXISTS "${spacetime_CMAKE_DIR}/CMakeCache.txt")
+    # We're in the build tree
+    set(spacetime_INCLUDE_DIRS "@PROJECT_SOURCE_DIR@/include")
+else()
+    # We're in the install tree - use standard relative path
+    set(spacetime_INCLUDE_DIRS "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_INCLUDEDIR@")
+endif()
+
+# Find required dependencies
+find_dependency(Qt6 REQUIRED COMPONENTS Core Gui Xml Network Widgets OpenGLWidgets)
+find_dependency(Eigen3 3.4 REQUIRED)
+find_dependency(lgmath REQUIRED)
+find_dependency(VTK 9.3 REQUIRED)
+find_dependency(jsoncpp REQUIRED)
+find_dependency(tsl-robin-map REQUIRED)
+
+# Find optional dependencies
+find_dependency(OpenMP)
+
+# Import the targets
+if(NOT TARGET spacetime::spacetime)
+    include("${spacetime_CMAKE_DIR}/spacetimeTargets.cmake")
+endif()
+
+# Set library variable for compatibility
+set(spacetime_LIBRARIES spacetime::spacetime)
+
+# Verify that all required components are found
+check_required_components(spacetime)
+
+# Print status message
+if(spacetime_FIND_QUIETLY)
+    # Don't print anything
+else()
+    message(STATUS "Found spacetime: ${spacetime_VERSION}")
+endif()
