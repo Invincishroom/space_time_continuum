@@ -81,6 +81,7 @@ This repository relies on several third party packages listed below that each ne
 - [VTK 9.3](https://vtk.org/)
 - [Qt 6.8.0](https://contribute.qt-project.org/)
 - [lgmath](https://github.com/utiasASRL/lgmath)
+- [robin-map](https://github.com/Tessil/robin-map)
 
 ### Installation 
 
