@@ -11,6 +11,8 @@ A continuous-time-and-space state estimation framework for real-time dynamic sta
 <h4>
     <a href="https://arxiv.org/src/2510.26623v1/anc/results_video.mp4">View Demo</a>
     <span> · </span>
+    <a href="https://github.com/utiasASRL/space_time_continuum/blob/main/CHANGELOG.md">See Changes</a>
+    <span> · </span>
     <a href="https://github.com/utiasASRL/space_time_continuum/issues">Report Bug</a>
     <span> · </span>
     <a href="https://github.com/utiasASRL/space_time_continuum/issues">Request Feature</a>
@@ -32,11 +34,10 @@ A continuous-time-and-space state estimation framework for real-time dynamic sta
 # Table of Contents
 
 - [About](#about)
-- [Getting Started](#toolbox-getting-started)
+- [Getting Started](#getting-started)
   - [Prerequisites](#prerequisites)
   - [Installation](#installation)
-  - [Running Tests](#running-tests)
-  - [Run Demos](#run-demos)
+  - [Running Demos](#running-demos)
 - [Contributing](#contributing)
 - [FAQ](#faq)
 - [Publications](#publications)
@@ -80,7 +81,7 @@ This repository relies on several third party packages listed below that each ne
 - [Eigen 3.4](https://libeigen.gitlab.io/)
 - [VTK 9.3](https://vtk.org/)
 - [Qt 6.8.0](https://contribute.qt-project.org/)
-- [lgmath](https://github.com/utiasASRL/lgmath)
+- [lgmath](https://github.com/utiasASRL/lgmath) *Note: This dependency will switch to GTSAM in the next version*
 - [robin-map](https://github.com/Tessil/robin-map)
 
 ### Installation 
@@ -97,7 +98,9 @@ To run the unit tests,
 ./run_tests
 ``` -->
 
-Lastly, to run paper demos, use the following 
+### Running Demos
+
+To run paper demos, use the following
 
 ```bash
 ./run_demo <estimator> <robot_number> <trial>
@@ -132,7 +135,7 @@ Four robots are used in the following trials. Their descriptions are as follows:
 **Notes:**
 
 - Demos for [3] to be added at a later time.
-- Small changes have been made to the code base and configurations that have resulted in small deviations in the results from the original published works. The conclusions of each work remain unchanged. Older versions of the project that have been used in each of the works can be made available upon request, though as with many early research projects, user-friendliness was not a priority at the time.
+- Small changes have been made to the code base and configurations that have resulted in small deviations in the results from the original published works. The conclusions of each work remain unchanged. Older versions of the project that have been used in each of the works can be made available upon request, though as with many early research projects, user-friendliness was not a priority at the time and I strongly recommend using the current version.
 
 </details>
 
@@ -143,6 +146,8 @@ Four robots are used in the following trials. Their descriptions are as follows:
 We are open to contribution from third parties! Please use the following
 
 ### Adding a new measurement factor type
+
+*Note: This will be deprecated in the next version as we switch to a GTSAM backend*
 
 If you have developed a new measurement factor that you think others would find useful, feel free to open a pull request including the new factor! To make a new factor, it must inherit the ``Spacetime::Factors::MeasurementFactor`` class. The mandatory functions ``getError`` and ``getJacobian`` must be implemented. Please see existing measurement factors and [this example](examples/custom_factor) for reference. In your pull request please include:
 
@@ -161,7 +166,7 @@ Please [open an issue](https://github.com/utiasASRL/space_time_continuum/issues)
 <details>
 <summary><strong>Who is this project for?</strong></summary>
 
-The project in its current state remains research focused. It is meant for individuals who are working in state estimation or otherwise need a stochastic state estimator in their work.
+The project in its current state remains research focused. It is meant for individuals who are working in state estimation or otherwise need a stochastic state estimator in their work. I am working to make it more usable beyond the provided demos, and hope to some day have it be a tool that can be easily deployed on other research setups.
 
 </details>
 
@@ -175,7 +180,7 @@ This code has been used and tested in a research environment. While the system i
 <details>
 <summary><strong>How do I cite this work?</strong></summary>
 
-See the [Citing](#publications) section of this README.
+See the [Publications](#publications) section of this README.
 
 </details>
 
@@ -213,7 +218,7 @@ State estimation techniques for continuum robots (CRs) typically involve using c
 <summary>BibTeX</summary>
 
 ```bibtex
-@article{Teetaert2025b,
+@article{Teetaert2025,
   title={A Stochastic Framework for Continuous-Time State Estimation of Continuum Robots}, 
   author={Spencer Teetaert and Sven Lilge and Jessica Burgner-Kahrs and Timothy D. Barfoot},
   year={2025},
@@ -271,12 +276,14 @@ Localization and mapping of an environment are crucial tasks for any robot opera
 <summary>BibTeX</summary>
 
 ```bibtex
-@article{Teetaert2026b,
+@inproceedings{Teetaert2026b,
   title={Continuum Robot Localization using Distributed Time-of-Flight Sensors},
   author={Spencer Teetaert and Giammarco Caroleo and Marco Pontin and Sven Lilge and Jessica Burgner-Kahrs and Timothy D. Barfoot and Perla Maiolino},
-  year={2026},
-  eprint={2602.07209},
-  archivePrefix={arXiv}
+  booktitle={Proceedings of Robotics: Science and Systems},
+  pubstate={forthcoming},
+  address={Sydney, Australia},
+  month={7},
+  year={2026}
 }
 ```
 
