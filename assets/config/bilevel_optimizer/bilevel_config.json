@@ -1,0 +1,8 @@
+{
+    "max_iterations": 200,
+    "learning_rate": 0.01,
+    "tol_grad": 1e-5,
+    "tol_loss": 1e-5,
+    "use_exponential_param": true,
+    "verbose": false
+}

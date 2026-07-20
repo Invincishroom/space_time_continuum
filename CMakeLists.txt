@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(spacetime VERSION 1.0.0 LANGUAGES CXX)
+project(spacetime VERSION 1.0.0 LANGUAGES C CXX)
 
 #Important CMAKE stuff
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
@@ -30,12 +30,16 @@ if(Profile)
 endif()
 
 
+
 ### Dependency Finds
 
 #Qt
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Xml Network Widgets OpenGLWidgets)
 qt_standard_project_setup()
-
+#MPI
+find_package(MPI COMPONENTS CXX REQUIRED)
+set(MPI_C_COMPILER /usr/bin/mpicc)
+set(MPI_CXX_COMPILER /usr/bin/mpicxx)
 #Eigen
 find_package(Eigen3 3.4 REQUIRED NO_MODULE)
 
@@ -198,4 +202,7 @@ if(Estimator)
     qt_add_executable(estimator scripts/main.cpp)
     target_link_libraries(estimator PRIVATE ${PROJECT_NAME})
     target_sources(estimator PRIVATE ${H_FILES_TOOLS} ${CPP_FILES_TOOLS})
+
+    qt_add_executable(BilevelOptimizer src/BilevelOptimizer.cpp)
+    target_link_libraries(BilevelOptimizer PRIVATE ${PROJECT_NAME})
 endif()

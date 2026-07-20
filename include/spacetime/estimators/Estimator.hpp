@@ -115,6 +115,17 @@ namespace Spacetime
             std::ostringstream message;
             std::shared_ptr<steam_icp::Map> map;
         };
+
+        struct FactorGraphLinearization
+        {
+            Eigen::SparseMatrix<double> H;
+            Eigen::VectorXd rhs;
+            std::vector<Eigen::VectorXd> factor_errors;
+            std::vector<Eigen::MatrixXd> factor_jacobians;
+            std::vector<Eigen::MatrixXd> factor_Qs;
+            std::vector<std::vector<int>> factor_node_indices;
+        };
+
         Estimator() = default;
         Estimator(RobotTopology topology, Hyperparameters parameters, Options options) { initializeEstimator(topology, parameters, options); }
         void initializeEstimator(RobotTopology topology, Hyperparameters parameters, Options options);
@@ -138,6 +149,19 @@ namespace Spacetime
         // Interpolate between the estimation nodes
         void interpolateStates(SystemState<DTYPE> &state);
         void buildCovarianceSquare(SystemState<DTYPE>::Node &node, const Eigen::MatrixX<double> &covariance, const SystemState<DTYPE> &state, const RobotTopology &topology);
+
+        // Extract per-factor linearisation data (errors, jacobians, information matrices)
+        // and assemble the full information matrix H for a given state.
+        void extractJacobianHessian(const SystemState<DTYPE> &state,
+                        Eigen::SparseMatrix<double> &H,
+                        std::vector<Eigen::VectorXd> &factor_errors,
+                        std::vector<Eigen::MatrixXd> &factor_jacobians,
+                        std::vector<Eigen::MatrixXd> &factor_Qs,
+                        std::vector<std::vector<int>> &factor_node_indices) const;
+
+        static FactorGraphLinearization assembleFactorGraph(const std::vector<SystemState<DTYPE>::Node> &nodes,
+                                    const std::vector<std::shared_ptr<Factors::Factor>> &factors,
+                                    const std::vector<std::vector<int>> &factor_node_indices = {});
 
         // Returns the state estimate of the last estimation computation with additional queried nodes
         // Careful: Will use the last known state (i.e. the last state computed and returned from computeStateEstimate)

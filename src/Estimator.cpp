@@ -445,10 +445,10 @@ namespace Spacetime
         k1 = (std::abs(node_ts.time - node0.time) < TOLERANCE) ? -1 : k + 1;
         n1 = (std::abs(node_ts.arclength - node0.arclength) < TOLERANCE) ? -1 : n + 1;
         // std::cout << "Measurement at t=" << measurement.t << ", s=" << measurement.s << " uses nodes k=" << k << ", n=" << n << " and k1=" << k1 << ", n1=" << n1 << std::endl;
-        if (topology.K == 0)
-            k1 = 0;
-        if (topology.N == 0)
-            n1 = 0;
+        if (topology.K <= 1)
+            k1 = (unsigned int)(-1);
+        if (topology.N <= 1)
+            n1 = (unsigned int)(-1);
 
         SystemState<DTYPE>::Node node1;
         Eigen::VectorX<DTYPE> e;
@@ -794,7 +794,7 @@ namespace Spacetime
         return dx;
     }
 
-    void Estimator::perturbState(SystemState<DTYPE> &state, double scale)
+    void Estimator::perturbState(SystemState<DTYPE> &state, double scale) //unused?
     {
         std::normal_distribution<double> dist(0, 1);
         auto gaussian = [&](double)
@@ -906,6 +906,61 @@ namespace Spacetime
 
         assert((n != (unsigned int)-1) && "ERR: Query arclength not on robot.");
         assert((k != (unsigned int)-1) && "ERR: Query time not in estimation window.");
+
+        const unsigned int max_K = state.getK(m_robot_topology);
+
+        // Avoid invalid neighbor access on degenerate grids and time/space boundaries.
+        if (m_robot_topology.N <= 1 || max_K <= 1)
+        {
+            const auto &node00 = state.estimation_nodes[k * m_robot_topology.N + n];
+
+            if (m_robot_topology.N <= 1 && max_K <= 1)
+            {
+                query_node = node00;
+                if (compute_jac)
+                {
+                    jac.resize(18, 18);
+                    jac.setZero();
+                    jac.block<18, 18>(0, 0).setIdentity();
+                }
+                return;
+            }
+
+            if (m_robot_topology.N <= 1)
+            {
+                if (std::abs(query_node.time - node00.time) < TOLERANCE || (k + 1) >= max_K)
+                {
+                    query_node = node00;
+                    if (compute_jac)
+                    {
+                        jac.resize(18, 18);
+                        jac.setZero();
+                        jac.block<18, 18>(0, 0).setIdentity();
+                    }
+                    return;
+                }
+
+                const auto &node01 = state.estimation_nodes[(k + 1) * m_robot_topology.N + n];
+                interpolateMean1D(query_node, node00, node01, jac, compute_jac);
+                return;
+            }
+
+            if (std::abs(query_node.arclength - node00.arclength) < TOLERANCE || (n + 1) >= m_robot_topology.N)
+            {
+                query_node = node00;
+                if (compute_jac)
+                {
+                    jac.resize(18, 18);
+                    jac.setZero();
+                    jac.block<18, 18>(0, 0).setIdentity();
+                }
+                return;
+            }
+
+            const auto &node10 = state.estimation_nodes[k * m_robot_topology.N + (n + 1)];
+            interpolateMean1D(query_node, node00, node10, jac, compute_jac);
+            return;
+        }
 
         const unsigned int k1 = k + 1;
         const unsigned int n1 = n + 1;
@@ -1367,7 +1422,6 @@ namespace Spacetime
             m_P = constructProjectionMatrix();
             m_state = constructInitialGuess(m_options.init_guess_type, ts);
         }
-
         // Setup the initial guess depending on chosen option
         Results results;
         results.state = m_state;
@@ -1387,13 +1441,37 @@ namespace Spacetime
         // Solve the system iteratively
         for (unsigned int iter = 0; iter < m_options.max_optimization_iterations; iter++)
         {
+            std::cout << "Iteration: " << iter << std::endl;
             DTYPE cost = 0.0;
-
+            
             // Clear triplet lists
             A_tripletList.clear();
             b_tripletList.clear();
             A.resize(18 * total_nodes, 18 * total_nodes);
             b.resize(18 * total_nodes, 1);
+            if(verbose_mode)
+            {
+                std::cout << "A size: " << A.rows() << " x " << A.cols() << std::endl;
+                std::cout << "b size: " << b.rows() << " x " << b.cols() << std::endl;
+                //Print A and b
+                for (int i = 0; i < A.rows(); i++)
+                {
+                    for (int j = 0; j < A.cols(); j++)
+                    {
+                        if (A.coeff(i, j) != 0)
+                        {
+                            std::cout << "A(" << i << "," << j << ") = " << A.coeff(i, j) << std::endl;
+                        }
+                    }
+                }
+                for (int i = 0; i < b.rows(); i++)
+                {
+                    if (b.coeff(i, 0) != 0)
+                    {
+                        std::cout << "b(" << i << ",0) = " << b.coeff(i, 0) << std::endl;
+                    }
+                }
+            }
 
             // Assemble prior terms
             DTYPE cost_p = 0.0;
@@ -1527,6 +1605,13 @@ namespace Spacetime
             {
                 updateStateVariables(results.state, dx);
             }
+            if(verbose_mode)
+            {
+                for (unsigned int i = 0; i < dx.size(); i++)
+                {
+                    std::cout << "dx[" << i << "] = " << dx[i] << std::endl;
+                }                
+            }
 
             // Check if the cost during the last couple iterations are still changing
             bool detect_convergence = false;
@@ -1549,7 +1634,14 @@ namespace Spacetime
                 return results;
             }
         }
-
+        std::cout << "State estimation complete." << std::endl;
+        if(verbose_mode)
+        {
+            for (unsigned int i = 0; i < results.state.estimation_nodes.size(); i++)
+            {
+                std::cout << "Node " << i << ": s = " << results.state.estimation_nodes[i].arclength << ", t = " << results.state.estimation_nodes[i].time << std::endl;
+            }
+        }
         // Extract covariances and uncertainties
         if (m_options.compute_covariances)
         {
@@ -1669,4 +1761,226 @@ namespace Spacetime
 
         return samples;
     }
-} // namespace spacetime
+
+    void Estimator::extractJacobianHessian(const SystemState<DTYPE> &state,
+                                           Eigen::SparseMatrix<double> &H,
+                                           std::vector<Eigen::VectorXd> &factor_errors,
+                                           std::vector<Eigen::MatrixXd> &factor_jacobians,
+                                           std::vector<Eigen::MatrixXd> &factor_Qs,
+                                           std::vector<std::vector<int>> &factor_node_indices) const
+    {
+        // Assemble prior and measurement terms similarly to computeStateEstimate,
+        // but capture per-factor linearisation data (e, E, Q) and build H.
+        unsigned int total_nodes = m_robot_topology.K * m_robot_topology.N;
+
+        std::cout << "Extracting Jacobian and Hessian for " << total_nodes << " nodes." << std::endl;
+        std::vector<Eigen::Triplet<double>> A_tripletList;
+        A_tripletList.reserve(1024);
+
+        factor_errors.clear();
+        factor_jacobians.clear();
+        factor_Qs.clear();
+        factor_node_indices.clear();
+
+        // PRIOR TERMS
+        std::cout << "Assembling prior terms..." << std::endl;
+        for (unsigned int i = 0; i < total_nodes; i++)
+        {
+            unsigned int n = i % m_robot_topology.N;
+            unsigned int k = i / m_robot_topology.N;
+
+            if (n == 0)
+            {
+                // Unary prior at base node
+                const auto &node = state.estimation_nodes[k * m_robot_topology.N + n];
+                Eigen::VectorX<DTYPE> e;
+                Eigen::Matrix<double, 18, 18> S;
+                if (m_options.use_autodiff)
+                    S = m_unary_factor->Factor::getJacobian({node}, e);
+                else
+                    S = m_unary_factor->getJacobian({node}, e);
+
+                Eigen::Matrix<double, 18, 18> weight = m_unary_factor->getWeight().cast<double>();
+
+                Eigen::MatrixX<double> A_block = S.transpose() * weight * S;
+
+                // store linearization
+                factor_errors.push_back(e.template cast<double>());
+                factor_jacobians.push_back(S);
+                factor_Qs.push_back(weight);
+                factor_node_indices.push_back({(int)getOptimizationIndex(n, k, m_robot_topology)});
+
+                // push triplets
+                std::array<unsigned int, 1> row_indices = {getOptimizationIndex(n, k, m_robot_topology)};
+                for (int row_block = 0; row_block < 18; row_block++)
+                {
+                    unsigned int idx_row = row_indices[row_block / 18] + (row_block % 18);
+                    for (int col_block = 0; col_block < 18; col_block++)
+                    {
+                        unsigned int idx_col = row_indices[col_block / 18] + (col_block % 18);
+                        A_tripletList.emplace_back(idx_row, idx_col, A_block(row_block, col_block));
+                    }
+                }
+            }
+
+            if (n != 0)
+            {
+                // Binary space term between n-1 and n
+                const auto &state1 = state.estimation_nodes[k * m_robot_topology.N + n];
+                const auto &state0 = state.estimation_nodes[k * m_robot_topology.N + n - 1];
+
+                Eigen::VectorX<DTYPE> e;
+                Eigen::Matrix<DTYPE, 18, 18> weightDT = m_binary_space_factor->getWeight({state0, state1});
+                Eigen::Matrix<double, 18, 36> S;
+                if (m_options.use_autodiff)
+                    S = m_binary_space_factor->Factor::getJacobian({state0, state1}, e);
+                else
+                    S = m_binary_space_factor->getJacobian({state0, state1}, e);
+
+                Eigen::Matrix<double, 18, 18> weight = weightDT.cast<double>();
+                Eigen::MatrixX<double> A_block = S.transpose() * weight * S;
+
+                // store linearization
+                factor_errors.push_back(e.template cast<double>());
+                factor_jacobians.push_back(S);
+                factor_Qs.push_back(weight);
+                factor_node_indices.push_back({(int)getOptimizationIndex(n - 1, k, m_robot_topology), (int)getOptimizationIndex(n, k, m_robot_topology)});
+
+                std::array<unsigned int, 2> row_indices = {getOptimizationIndex(n - 1, k, m_robot_topology), getOptimizationIndex(n, k, m_robot_topology)};
+                for (int row_block = 0; row_block < 36; row_block++)
+                {
+                    unsigned int idx_row = row_indices[row_block / 18] + (row_block % 18);
+                    for (int col_block = 0; col_block < 36; col_block++)
+                    {
+                        unsigned int idx_col = row_indices[col_block / 18] + (col_block % 18);
+                        A_tripletList.emplace_back(idx_row, idx_col, A_block(row_block, col_block));
+                    }
+                }
+            }
+
+            if (k > 0 && !m_robot_topology.use_1D_estimator)
+            {
+                // Binary time term between k-1 and k at same spatial index n
+                const auto &state0 = state.estimation_nodes[(k - 1) * m_robot_topology.N + n];
+                const auto &state1 = state.estimation_nodes[k * m_robot_topology.N + n];
+
+                Eigen::VectorX<DTYPE> e;
+                Eigen::Matrix<DTYPE, 18, 18> weightDT = m_binary_time_factor->getWeight({state0, state1});
+                Eigen::Matrix<double, 18, 36> S;
+                if (m_options.use_autodiff)
+                    S = m_binary_time_factor->Factor::getJacobian({state0, state1}, e);
+                else
+                    S = m_binary_time_factor->getJacobian({state0, state1}, e);
+
+                Eigen::Matrix<double, 18, 18> weight = weightDT.cast<double>();
+                Eigen::MatrixX<double> A_block = S.transpose() * weight * S;
+
+                // store linearization
+                factor_errors.push_back(e.template cast<double>());
+                factor_jacobians.push_back(S);
+                factor_Qs.push_back(weight);
+                factor_node_indices.push_back({(int)getOptimizationIndex(n, k - 1, m_robot_topology), (int)getOptimizationIndex(n, k, m_robot_topology)});
+
+                std::array<unsigned int, 2> row_indices = {getOptimizationIndex(n, k - 1, m_robot_topology), getOptimizationIndex(n, k, m_robot_topology)};
+                for (int row_block = 0; row_block < 36; row_block++)
+                {
+                    unsigned int idx_row = row_indices[row_block / 18] + (row_block % 18);
+                    for (int col_block = 0; col_block < 36; col_block++)
+                    {
+                        unsigned int idx_col = row_indices[col_block / 18] + (col_block % 18);
+                        A_tripletList.emplace_back(idx_row, idx_col, A_block(row_block, col_block));
+                    }
+                }
+            }
+        }
+
+        std::cout << "Assembling measurement terms..." << std::endl;
+        // MEASUREMENT TERMS
+        int end_meas = m_measurement_factors.size();
+        for (int i = 0; i < end_meas; i++)
+        {
+            const auto &p_factor = m_measurement_factors[i];
+            const auto &measurement = p_factor->getMeas();
+
+            if (measurement.t < state.estimation_nodes.front().time - TOLERANCE)
+                continue;
+            if (measurement.t > state.estimation_nodes.back().time + TOLERANCE)
+                continue;
+
+            SystemState<DTYPE>::Node node_ts;
+            node_ts.time = measurement.t;
+            node_ts.arclength = measurement.s;
+
+            Eigen::VectorX<DTYPE> e;
+            Eigen::MatrixX<double> G, S;
+
+            unsigned int n, k, n1, k1;
+            getNKIndeces(measurement.s, measurement.t, n, k, state, m_robot_topology);
+            if (n == (unsigned int)(-1) || k == (unsigned int)(-1))
+                continue;
+
+            SystemState<DTYPE>::Node node0 = state.estimation_nodes[k * m_robot_topology.N + n];
+
+            k1 = (std::abs(node_ts.time - node0.time) < TOLERANCE) ? -1 : k + 1;
+            n1 = (std::abs(node_ts.arclength - node0.arclength) < TOLERANCE) ? -1 : n + 1;
+            if (m_robot_topology.K <= 1)
+                k1 = (unsigned int)(-1);
+            if (m_robot_topology.N <= 1)
+                n1 = (unsigned int)(-1);
+
+            Eigen::MatrixX<double> jac;
+            interpolateMean2D(node_ts, state, jac, true);
+            if (m_options.use_autodiff)
+                G = p_factor->Factor::getJacobian({node_ts}, e);
+            else
+                G = p_factor->getJacobian({node_ts}, e);
+            S = G * jac;
+
+            p_factor->setOperatingPoint(node_ts);
+
+            Eigen::MatrixX<double> weight = p_factor->getWeight().cast<double>();
+
+            Eigen::MatrixX<double> A_block = S.transpose() * weight * S;
+
+            // determine row indices (nodes involved)
+            std::vector<unsigned int> row_indices;
+            row_indices.push_back(getOptimizationIndex(n, k, m_robot_topology));
+            if (n1 != (unsigned int)(-1))
+                row_indices.push_back(getOptimizationIndex(n1, k, m_robot_topology));
+            if (k1 != (unsigned int)(-1))
+                row_indices.push_back(getOptimizationIndex(n, k1, m_robot_topology));
+            if (n1 != (unsigned int)(-1) && k1 != (unsigned int)(-1))
+                row_indices.push_back(getOptimizationIndex(n1, k1, m_robot_topology));
+
+            // store linearization
+            factor_errors.push_back(e.template cast<double>());
+            factor_jacobians.push_back(S);
+            factor_Qs.push_back(weight);
+            std::vector<int> nodes_int;
+            for (auto ri : row_indices)
+                nodes_int.push_back((int)ri);
+            factor_node_indices.push_back(nodes_int);
+
+            // write triplets
+            for (int row_block = 0; row_block < (int)A_block.rows(); row_block++)
+            {
+                unsigned int idx_row = row_indices[row_block / 18] + (row_block % 18);
+                for (int col_block = 0; col_block < (int)A_block.cols(); col_block++)
+                {
+                    unsigned int idx_col = row_indices[col_block / 18] + (col_block % 18);
+                    A_tripletList.emplace_back(idx_row, idx_col, A_block(row_block, col_block));
+                }
+            }
+        }
+        std::cout << "Finished assembling Jacobian and Hessian." << std::endl;
+        std::cout << "Number of factors: " << factor_errors.size() << std::endl;
+        std::cout << "Number of triplets: " << A_tripletList.size() << std::endl;
+        std::cout << "Number of nodes: " << total_nodes << std::endl;
+        // Build sparse H
+        int size = 18 * total_nodes;
+        H.resize(size, size);
+        H.setFromTriplets(A_tripletList.begin(), A_tripletList.end());
+        std::cout << "Hessian size: " << H.rows() << " x " << H.cols() << std::endl;
+    }
+
+} // namespace Spacetime

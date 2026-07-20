@@ -1,0 +1,32 @@
+{
+    "initial_condition": {
+        "start_time": 0,
+        "initialize_straight": true,
+        "initial_perturbation": 0,
+        "T0": [
+            1, 0, 0, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            0, 0, 0, 1
+        ],
+        "epsilon0": [0, 0, 0, 0, 0, 0],
+        "varpi0": [0, 0, 0, 0, 0, 0]
+    },
+    "data": {
+        "folder_path": "assets/data/minimal/",
+        "aurora": true,
+        "velocity": false,
+        "gyro": false,
+        "lidar": false,
+        "fbgs": false,
+        "start_time": 0,
+        "end_time": 0.4
+    },
+    "options": {
+        "estimator": "batch",
+        "interpolate_measurements": true,
+        "compute_covariances": false,
+        "extract_from_front": false,
+        "dt": 0.1
+    }
+}

@@ -60,7 +60,7 @@ namespace Spacetime
         }
     };
 
-    struct Hyperparameters
+        struct Hyperparameters
     {
         Eigen::Matrix<double, 18, 18> P0;
         Eigen::Matrix<double, 6, 6> Q1;

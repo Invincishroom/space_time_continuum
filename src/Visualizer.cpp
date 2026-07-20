@@ -446,13 +446,25 @@ namespace Spacetime
         m_diagnosticsLabel->refresh();
 
         if (mp_floor)
+        {
+            info() << "Setting floor visibility to: " << m_options.show_ground_plane;
             mp_floor->SetVisibility(m_options.show_ground_plane);
+        }
         if (mp_grid_actor)
+        {
+            info() << "Setting grid visibility to: " << m_show_grid;
             mp_grid_actor->SetVisibility(m_show_grid);
+        }
         if (mp_environment_actor)
+        {
+            info() << "Setting environment visibility to: " << m_options.environment.show;
             mp_environment_actor->SetVisibility(m_options.environment.show);
+        }
         if (mp_map_actor)
+        {
+            info() << "Setting map visibility to: " << m_show_map;
             mp_map_actor->SetVisibility(m_show_map);
+        }
 
         if (m_selected_frame_arclength != m_plotWidget->getArclength())
         {
@@ -482,26 +494,34 @@ namespace Spacetime
                 mp_axes_k[i]->SetVisibility(true);
                 mp_axes_k1[i]->SetVisibility(true);
 
-                mp_axes_k[i]->SetCylinderRadius(std::max(0.025, 0.25 * m_options.topology.radius));
-                mp_axes_k[i]->SetTotalLength(std::max(0.015, 1.5 * m_options.topology.radius), std::max(0.015, 1.5 * m_options.topology.radius), std::max(0.015, 1.5 * m_options.topology.radius));
-                mp_axes_k1[i]->SetCylinderRadius(std::max(0.025, 0.25 * m_options.topology.radius));
-                mp_axes_k1[i]->SetTotalLength(std::max(0.015, 1.5 * m_options.topology.radius), std::max(0.015, 1.5 * m_options.topology.radius), std::max(0.015, 1.5 * m_options.topology.radius));
-                mp_axes_interp[i]->SetCylinderRadius(std::max(0.025, 0.25 * m_options.topology.radius));
-                mp_axes_interp[i]->SetTotalLength(std::max(0.015, 1.5 * m_options.topology.radius), std::max(0.015, 1.5 * m_options.topology.radius), std::max(0.015, 1.5 * m_options.topology.radius));
+                const double base_length = std::max(0.015, 1.5 * m_options.topology.radius);
+                const double requested_radius = std::max(0.001, 0.25 * m_options.topology.radius);
+                const double base_radius = std::min(requested_radius, 0.2 * base_length);
+
+                mp_axes_k[i]->SetCylinderRadius(base_radius);
+                mp_axes_k[i]->SetTotalLength(base_length, base_length, base_length);
+                mp_axes_k1[i]->SetCylinderRadius(base_radius);
+                mp_axes_k1[i]->SetTotalLength(base_length, base_length, base_length);
+                mp_axes_interp[i]->SetCylinderRadius(base_radius);
+                mp_axes_interp[i]->SetTotalLength(base_length, base_length, base_length);
+
 
                 if (mp_axes_k1[i] == m_selected_frame)
                 {
-                    mp_axes_k1[i]->SetCylinderRadius(0.05);
+                    info() << "Selected frame is k+1, setting it to highlighted size";
+                    mp_axes_k1[i]->SetCylinderRadius(0.004);
                     mp_axes_k1[i]->SetTotalLength(0.02, 0.02, 0.02);
                 }
                 else if (mp_axes_k[i] == m_selected_frame)
                 {
-                    mp_axes_k[i]->SetCylinderRadius(0.05);
+                    info() << "Selected frame is k, setting it to highlighted size";
+                    mp_axes_k[i]->SetCylinderRadius(0.004);
                     mp_axes_k[i]->SetTotalLength(0.02, 0.02, 0.02);
                 }
                 else if (mp_axes_interp[i] == m_selected_frame)
                 {
-                    mp_axes_interp[i]->SetCylinderRadius(0.05);
+                    info() << "Selected frame is interpolation, setting it to highlighted size";
+                    mp_axes_interp[i]->SetCylinderRadius(0.004);
                     mp_axes_interp[i]->SetTotalLength(0.02, 0.02, 0.02);
                 }
             }
@@ -612,6 +632,8 @@ namespace Spacetime
                     continue;
                 mp_aurora_meas[meas_idx]->SetUserMatrix(meas_frame_vtk);
                 mp_aurora_meas[meas_idx]->SetVisibility(true);
+
+                info() << "Showing Aurora measurement at time: " << measurement.t << " with arclength: " << m_measurements[m]->getOperatingPoint().arclength;
                 meas_idx++;
             }
 
@@ -667,6 +689,7 @@ namespace Spacetime
                         }
                         mp_sensor_module_actors[i]->SetUserMatrix(sensor_frame_vtk);
                         mp_sensor_module_actors[i]->SetVisibility(true);
+                        info() << "Showing sensor module frame for sensor at arclength: " << m_sensor_module_arclengths[i] << " with measurement time: " << measurement.t;
                         break;
                     }
                 }
@@ -686,9 +709,9 @@ namespace Spacetime
             unsigned int meas_idx = 0;
             for (unsigned int m = 0; m < m_gt.size(); m++)
             {
-                if (m_gt[m].t < m_time - 1e-2)
+                if (m_gt[m].t < m_time - m_timestep / 2.0 - TOLERANCE)
                     continue;
-                else if (m_gt[m].t > m_time + 1e-2)
+                else if (m_gt[m].t > m_time + m_timestep / 2.0 + TOLERANCE || m_gt[m].t > m_state.estimation_nodes.back().time)
                     break;
 
                 if (m_gt[m].type == Spacetime::SensorMeasurement::Type::Pose)
@@ -751,6 +774,7 @@ namespace Spacetime
             }
             else
             {
+                info() << "Covariances on interpolation nodes are disabled, hiding all ellipsoids";
                 // Hide all ellipsoids
                 for (unsigned int i = 0; i < mp_ellipsoid_actors.size(); i++)
                 {
@@ -775,6 +799,7 @@ namespace Spacetime
                         mp_ellipsoid_actors_k[m]->SetVisibility(true);
                         mp_ellipsoid_actors_k[m]->SetUserMatrix(sphere_frame_vtk);
                         mp_ellipsoid_actors_k[m]->SetScale(s(0), s(1), s(2));
+                        info() << "Showing covariance ellipsoid for estimation node k at arclength: " << m_state.estimation_nodes[i].arclength << " with time: " << m_state.estimation_nodes[i].time;
                     }
                     if ((size_t)i + m_options.topology.N < m_state.estimation_nodes.size())
                     {
@@ -785,6 +810,7 @@ namespace Spacetime
                             mp_ellipsoid_actors_k1[m]->SetVisibility(true);
                             mp_ellipsoid_actors_k1[m]->SetUserMatrix(sphere_frame_vtk);
                             mp_ellipsoid_actors_k1[m]->SetScale(s(0), s(1), s(2));
+                            info() << "Showing covariance ellipsoid for estimation node k+1 at arclength: " << m_state.estimation_nodes[i + m_options.topology.N].arclength << " with time: " << m_state.estimation_nodes[i + m_options.topology.N].time;
                         }
                         else
                         {
@@ -795,6 +821,7 @@ namespace Spacetime
             }
             else
             {
+                info() << "Covariances on estimation nodes are disabled, hiding all ellipsoids";
                 // Hide all ellipsoids
                 for (unsigned int i = 0; i < mp_ellipsoid_actors_k.size(); i++)
                 {
@@ -805,6 +832,9 @@ namespace Spacetime
         }
         else
         {
+            info() << "Covariances are disabled, hiding all ellipsoids";
+            info() << "m_options.robot.show_covariances: " << m_options.robot.show_covariances;
+            info() << "m_state.interpolation_nodes[0].covarianceAvailable(): " << m_state.interpolation_nodes[0].covarianceAvailable();
             // Hide all ellipsoids
             for (unsigned int i = 0; i < mp_ellipsoid_actors.size(); i++)
             {
@@ -1087,10 +1117,12 @@ namespace Spacetime
         {
             vtkSmartPointer<vtkActor> ellipsoid_actor_k = createEllipsoidActor(ellipsoid_mapper, true);
             mp_ellipsoid_actors_k.push_back(ellipsoid_actor_k);
+            info() << "Adding ellipsoid actor for frame " << n;
             mp_ren->AddActor(ellipsoid_actor_k);
 
             vtkSmartPointer<vtkActor> ellipsoid_actor_k1 = createEllipsoidActor(ellipsoid_mapper, true);
             mp_ellipsoid_actors_k1.push_back(ellipsoid_actor_k1);
+            info() << "Adding ellipsoid actor for frame " << n + 1;
             mp_ren->AddActor(ellipsoid_actor_k1);
         }
     }
@@ -1110,12 +1142,15 @@ namespace Spacetime
 
         for (unsigned int i = 0; i < m_options.aurora.count; i++)
         {
-            vtkSmartPointer<vtkAxesActor> meas = createAxesActor(0.5, 0.008);
+            const double cylinder_radius = std::max(0.025, 0.25 * m_options.topology.radius) * std::max(1.0, m_options.aurora.size);
+            const double axis_length = std::max(0.015, 1.5 * m_options.topology.radius) * std::max(1.0, m_options.aurora.size);
+            vtkSmartPointer<vtkAxesActor> meas = createAxesActor(cylinder_radius, axis_length);
             // vtkSmartPointer<vtkActor> meas = vtkSmartPointer<vtkActor>::New();
             // meas->SetMapper(sphereMapper);
             // meas->GetProperty()->SetColor(colors->GetColor3d("Cornsilk").GetData());
             mp_aurora_meas.push_back(meas);
             mp_ren->AddActor(meas);
+            info() << "Adding measurement actor " << i;
         }
     }
 
@@ -1127,6 +1162,7 @@ namespace Spacetime
             vtkSmartPointer<vtkAxesActor> gt_meas = createAxesActor(std::max(0.025, 0.25 * m_options.topology.radius) * m_options.vicon.size, std::max(0.015, 1.5 * m_options.topology.radius) * m_options.vicon.size);
             mp_gt.push_back(gt_meas);
             mp_ren->AddActor(gt_meas);
+            info() << "Adding ground truth actor " << i;
         }
     }
 
@@ -1281,7 +1317,8 @@ namespace Spacetime
         mp_grid_actor->GetProperty()->SetColor(0.5, 0.5, 0.5); // Gray color
         mp_grid_actor->GetProperty()->SetLineWidth(1.0);
         mp_grid_actor->GetProperty()->SetOpacity(0.3);
-
+        
+        info() << "Grid bounds: [" << x_min << ", " << x_max << ", " << y_min << ", " << y_max << ", " << z_min << ", " << z_max << "]";
         mp_ren->AddActor(mp_grid_actor);
     }
 
@@ -1337,6 +1374,8 @@ namespace Spacetime
         mp_lidar_actor_inactive->GetProperty()->SetAmbient(0.3);
         mp_lidar_actor_inactive->GetProperty()->SetDiffuse(0.5);
         mp_lidar_actor_inactive->GetProperty()->SetSpecular(0.1);
+
+        info() << "Initialized lidar points: active and inactive. Active points are green, inactive points are red.";
         mp_ren->AddActor(mp_lidar_actor_inactive);
     }
 
@@ -1369,6 +1408,8 @@ namespace Spacetime
         mp_map_actor->GetProperty()->SetAmbient(0.3);
         mp_map_actor->GetProperty()->SetDiffuse(0.5);
         mp_map_actor->GetProperty()->SetSpecular(0.1);
+
+        info() << "Initialized map points. Map points are blue.";
         mp_ren->AddActor(mp_map_actor);
     }
 
