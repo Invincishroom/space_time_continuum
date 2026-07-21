@@ -1,8 +1,10 @@
 {
     "max_iterations": 200,
-    "learning_rate": 0.01,
+    "learning_rate": 5e-4,
     "tol_grad": 1e-5,
-    "tol_loss": 1e-5,
+    "tol_loss": 1e-3,
     "use_exponential_param": true,
-    "verbose": false
+    "verbose": true,
+    "enable_gradient_fd_check": false,
+    "gradient_fd_epsilon": 1e-6
 }

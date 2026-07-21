@@ -1449,6 +1449,7 @@ namespace Spacetime
             b_tripletList.clear();
             A.resize(18 * total_nodes, 18 * total_nodes);
             b.resize(18 * total_nodes, 1);
+            /*
             if(verbose_mode)
             {
                 std::cout << "A size: " << A.rows() << " x " << A.cols() << std::endl;
@@ -1472,7 +1473,7 @@ namespace Spacetime
                     }
                 }
             }
-
+            */
             // Assemble prior terms
             DTYPE cost_p = 0.0;
             assemblePriorTerms(A_tripletList, b_tripletList, cost_p, results.state, m_robot_topology, false);
@@ -1605,13 +1606,14 @@ namespace Spacetime
             {
                 updateStateVariables(results.state, dx);
             }
+            /*
             if(verbose_mode)
             {
                 for (unsigned int i = 0; i < dx.size(); i++)
                 {
                     std::cout << "dx[" << i << "] = " << dx[i] << std::endl;
                 }                
-            }
+            }*/
 
             // Check if the cost during the last couple iterations are still changing
             bool detect_convergence = false;
@@ -1635,6 +1637,7 @@ namespace Spacetime
             }
         }
         std::cout << "State estimation complete." << std::endl;
+        /*
         if(verbose_mode)
         {
             for (unsigned int i = 0; i < results.state.estimation_nodes.size(); i++)
@@ -1642,6 +1645,7 @@ namespace Spacetime
                 std::cout << "Node " << i << ": s = " << results.state.estimation_nodes[i].arclength << ", t = " << results.state.estimation_nodes[i].time << std::endl;
             }
         }
+        */
         // Extract covariances and uncertainties
         if (m_options.compute_covariances)
         {

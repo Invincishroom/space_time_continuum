@@ -15,22 +15,51 @@
 #endif
 
 #include <array>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include<iostream>
 #include<random>
 #include<algorithm>
+#include <functional>
 #include <limits>
 #include <sstream>
+#include <unordered_map>
+#include <unordered_set>
 #include<json/json.h>
 
 namespace // anonymous
 {
+    using Matrix18d = Eigen::Matrix<double, 18, 18>;
+    using Vector18d = Eigen::Matrix<double, 18, 1>;
+
+    struct MarginalCacheData
+    {
+        std::unordered_map<int, Matrix18d> node_information_blocks;
+        double factorization_ms = 0.0;
+        double marginal_solve_ms = 0.0;
+    };
+
+    struct FactorKernelSample
+    {
+        bool available = false;
+        std::vector<Spacetime::SystemState<DTYPE>::Node> local_nodes;
+        Eigen::VectorXd e_f;
+        Eigen::MatrixXd info_f;
+        Eigen::MatrixXd E_f;
+        Eigen::VectorXd lambda_f;
+        Eigen::VectorXd e_nodes;
+        double info_scale = 0.0;
+    };
+
     constexpr int kThetaSize = 36;
     constexpr int kP0Offset = 0;
     constexpr int kQ1Offset = 18;
     constexpr int kQ2Offset = 24;
     constexpr int kQ3Offset = 30;
+
+    Eigen::Matrix<double, 18, 1> computeNodeValidationError(const Spacetime::SystemState<DTYPE>::Node &estimate,
+                                                            const Spacetime::SystemState<DTYPE>::Node &ground_truth);
 
     //load JSON file from path and return as Json::Value
     std::filesystem::path resolveExistingPath(const std::initializer_list<std::filesystem::path>& candidates)
@@ -202,6 +231,78 @@ namespace // anonymous
         }
     }
 
+    void loadBilevelOptimizerConfigFromJson(const Json::Value &root, spacetime::Optimizer::OptimizerConfig &config)
+    {
+        if (root.isMember("max_iterations"))
+        {
+            config.max_iterations = root["max_iterations"].asInt();
+        }
+        if (root.isMember("learning_rate"))
+        {
+            config.learning_rate = root["learning_rate"].asDouble();
+        }
+        if (root.isMember("tol_grad"))
+        {
+            config.tol_grad = root["tol_grad"].asDouble();
+        }
+        if (root.isMember("tol_loss"))
+        {
+            config.tol_loss = root["tol_loss"].asDouble();
+        }
+        if (root.isMember("use_exponential_param"))
+        {
+            config.use_exponential_param = root["use_exponential_param"].asBool();
+        }
+        if (root.isMember("verbose"))
+        {
+            config.verbose = root["verbose"].asBool();
+        }
+        if (root.isMember("enable_gradient_fd_check"))
+        {
+            config.enable_gradient_fd_check = root["enable_gradient_fd_check"].asBool();
+        }
+        if (root.isMember("gradient_fd_epsilon"))
+        {
+            config.gradient_fd_epsilon = root["gradient_fd_epsilon"].asDouble();
+        }
+    }
+
+    Eigen::VectorXd loadInitialThetaFromRobotConfig(const Json::Value &robot_config)
+    {
+        const Json::Value weights = robot_config["weights"];
+        if (weights.isNull())
+        {
+            throw std::runtime_error("Robot config is missing the 'weights' section for initial theta.");
+        }
+
+        auto readWeights = [&](const char *name, int expected_size) {
+            const Json::Value values = weights[name];
+            if (!values.isArray() || static_cast<int>(values.size()) != expected_size)
+            {
+                throw std::runtime_error(std::string("Robot config weights '") + name + "' must be an array of size " + std::to_string(expected_size) + ".");
+            }
+
+            Eigen::VectorXd out(expected_size);
+            for (int i = 0; i < expected_size; ++i)
+            {
+                const double value = values[i].asDouble();
+                if (!(value > 0.0))
+                {
+                    throw std::runtime_error(std::string("Initial theta weight '") + name + "' must be strictly positive.");
+                }
+                out(i) = value;
+            }
+            return out;
+        };
+
+        Eigen::VectorXd theta = Eigen::VectorXd::Zero(kThetaSize);
+        theta.segment<18>(kP0Offset) = readWeights("P0", 18);
+        theta.segment<6>(kQ1Offset) = readWeights("Q1", 6);
+        theta.segment<6>(kQ2Offset) = readWeights("Q2", 6);
+        theta.segment<6>(kQ3Offset) = readWeights("Q3", 6);
+        return theta;
+    }
+
     void loadRobotTopologyFromJson(const Json::Value &root, Spacetime::RobotTopology &topology)
     {
         topology.N = root["topology"].isMember("N") ? root["topology"]["N"].asUInt() : 1;
@@ -346,6 +447,7 @@ namespace // anonymous
         return vector.segment(block_index * block_size, block_size);
     }
 
+    // For 
     spacetime::FactorGradientContrib computeDiagonalFactorGradient(const Eigen::VectorXd& e_f,
                                                                     const Eigen::MatrixXd& info_f,
                                                                     const Eigen::MatrixXd& E_f,
@@ -493,17 +595,25 @@ namespace // anonymous
                                                                     const Eigen::VectorXd& e_nodes,
                                                                     double info_scale)
     {
+        // If this is Time factor
         if (dynamic_cast<const Spacetime::Factors::BinaryTimeFactor*>(&factor) != nullptr)
         {
             return computeBinaryTimeFactorGradient(local_nodes, e_f, Q_f, E_f, lambda_f, e_nodes, info_scale);
         }
 
+        // If this is Space factor
         if (dynamic_cast<const Spacetime::Factors::BinarySpaceFactor*>(&factor) != nullptr)
         {
             return computeBinarySpaceFactorGradient(local_nodes, e_f, Q_f, E_f, lambda_f, e_nodes, info_scale);
         }
 
-        return computeDiagonalFactorGradient(e_f, Q_f, E_f, lambda_f, e_nodes, info_scale);
+        // If this is unary factor
+        if (dynamic_cast<const Spacetime::Factors::UnaryFactor*>(&factor) != nullptr)
+        {
+            return computeDiagonalFactorGradient(e_f, Q_f, E_f, lambda_f, e_nodes, info_scale);
+        }
+
+        throw std::runtime_error("Unknown factor type.");
     }
 
     Eigen::Matrix<double, 18, 18> computeNodeMarginalInformationBlock(const Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>>& solver,
@@ -525,8 +635,334 @@ namespace // anonymous
         Eigen::Matrix<double, 18, 18> marginal_cov = solved_columns.block(start, 0, node_dim, node_dim);
         marginal_cov = 0.5 * (marginal_cov + marginal_cov.transpose());
 
-        Eigen::Matrix<double, 18, 18> identity = Eigen::Matrix<double, 18, 18>::Identity();
+        Eigen::MatrixXd identity = Eigen::MatrixXd::Identity(18, 18);
         return solvePositiveDefiniteSystem(marginal_cov, identity);
+    }
+
+    MarginalCacheData buildMarginalCache(const Eigen::SparseMatrix<double>& H,
+                                         const std::vector<spacetime::ValidationTarget>& validation_targets)
+    {
+        MarginalCacheData cache;
+        std::unordered_set<int> unique_nodes;
+        unique_nodes.reserve(validation_targets.size());
+        for (const auto& target : validation_targets)
+        {
+            unique_nodes.insert(target.node_index);
+        }
+
+        auto t_factor_start = std::chrono::steady_clock::now();
+        Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
+        solver.compute(H);
+        if (solver.info() != Eigen::Success)
+        {
+            throw std::runtime_error("Failed to factorize H while building marginal cache.");
+        }
+        auto t_factor_end = std::chrono::steady_clock::now();
+        cache.factorization_ms = std::chrono::duration<double, std::milli>(t_factor_end - t_factor_start).count();
+
+        auto t_solve_start = std::chrono::steady_clock::now();
+        cache.node_information_blocks.reserve(unique_nodes.size());
+        for (const int node_index : unique_nodes)
+        {
+            cache.node_information_blocks.emplace(
+                node_index,
+                computeNodeMarginalInformationBlock(solver, H.rows(), node_index));
+        }
+        auto t_solve_end = std::chrono::steady_clock::now();
+        cache.marginal_solve_ms = std::chrono::duration<double, std::milli>(t_solve_end - t_solve_start).count();
+
+        return cache;
+    }
+
+    const Matrix18d& getCachedNodeInformationBlock(const MarginalCacheData& cache, int node_index)
+    {
+        const auto it = cache.node_information_blocks.find(node_index);
+        if (it == cache.node_information_blocks.end())
+        {
+            throw std::runtime_error("Node information block was not found in marginal cache.");
+        }
+        return it->second;
+    }
+
+    spacetime::ValidationLossData computeValidationLossWithMarginals(
+        const std::vector<spacetime::ValidationTarget>& validation_targets,
+        const std::vector<Spacetime::SystemState<DTYPE>::Node>& solved_nodes,
+        const MarginalCacheData& cache)
+    {
+        spacetime::ValidationLossData out;
+        if (validation_targets.empty() || solved_nodes.empty())
+        {
+            return out;
+        }
+
+        constexpr int node_dim = 18;
+        const int validation_count = static_cast<int>(validation_targets.size());
+        out.nees_per_node = Eigen::VectorXd::Zero(validation_count);
+        out.node_errors_stacked = Eigen::VectorXd::Zero(node_dim * validation_count);
+
+        for (int i = 0; i < validation_count; ++i)
+        {
+            const auto& target = validation_targets[static_cast<size_t>(i)];
+            if (target.node_index < 0 || target.node_index >= static_cast<int>(solved_nodes.size()))
+            {
+                throw std::runtime_error("computeValidationLossWithMarginals: validation node index out of range.");
+            }
+
+            const auto& estimate = solved_nodes[static_cast<size_t>(target.node_index)];
+            const Vector18d e = computeNodeValidationError(estimate, target.ground_truth);
+            out.node_errors_stacked.segment<18>(i * node_dim) = e;
+
+            const Matrix18d& p_inv_block = getCachedNodeInformationBlock(cache, target.node_index);
+            out.nees_per_node(i) = e.transpose() * p_inv_block * e;
+        }
+
+        out.mean_nees = out.nees_per_node.mean();
+        out.delta = out.mean_nees - 18.0;
+        out.loss = 0.5 * out.delta * out.delta;
+        return out;
+    }
+
+    Eigen::VectorXd computeAdjointRhsWithMarginals(const Eigen::SparseMatrix<double>& H,
+                                                   const std::vector<spacetime::ValidationTarget>& validation_targets,
+                                                   const spacetime::ValidationLossData& validation,
+                                                   const MarginalCacheData& cache)
+    {
+        Eigen::VectorXd rhs = Eigen::VectorXd::Zero(H.rows());
+        if (validation_targets.empty())
+        {
+            return rhs;
+        }
+
+        constexpr int node_dim = 18;
+        const int validation_count = static_cast<int>(validation_targets.size());
+        if (validation.node_errors_stacked.size() != validation_count * node_dim)
+        {
+            throw std::runtime_error("computeAdjointRhsWithMarginals: validation error vector has unexpected size.");
+        }
+
+        const double scale = 2.0 * validation.delta / static_cast<double>(validation_count);
+        for (int i = 0; i < validation_count; ++i)
+        {
+            const auto& target = validation_targets[static_cast<size_t>(i)];
+            if (target.node_index < 0 || (target.node_index + 1) * node_dim > rhs.size())
+            {
+                throw std::runtime_error("computeAdjointRhsWithMarginals: validation node index out of range.");
+            }
+
+            const Vector18d e = validation.node_errors_stacked.segment<18>(i * node_dim);
+            const Matrix18d& p_inv_block = getCachedNodeInformationBlock(cache, target.node_index);
+
+            Matrix18d J = Matrix18d::Identity();
+            J.block<6, 6>(0, 0) = se3::vec2jacinv(e.segment<6>(0));
+            rhs.segment<18>(target.node_index * node_dim) += J.transpose() * p_inv_block * e;
+        }
+
+        rhs *= scale;
+        return rhs;
+    }
+
+    Eigen::Matrix<double, 6, 6> diagonal6(const Eigen::VectorXd& values)
+    {
+        if (values.size() != 6)
+        {
+            throw std::runtime_error("Expected 6D diagonal parameter vector.");
+        }
+
+        Eigen::Matrix<double, 6, 6> out = Eigen::Matrix<double, 6, 6>::Zero();
+        for (int i = 0; i < 6; ++i)
+        {
+            out(i, i) = values(i);
+        }
+        return out;
+    }
+
+    Matrix18d buildTimeCovariance(const std::vector<Spacetime::SystemState<DTYPE>::Node>& local_nodes,
+                                  const Eigen::VectorXd& theta_local)
+    {
+        if (local_nodes.size() != 2 || theta_local.size() != 12)
+        {
+            throw std::runtime_error("buildTimeCovariance expects two local nodes and a 12D parameter vector.");
+        }
+
+        const double dt = local_nodes[1].time - local_nodes[0].time;
+        const double dt2 = dt * dt / 2.0;
+        const double dt3 = dt * dt * dt / 3.0;
+
+        const Eigen::Matrix<double, 6, 6> Q1 = diagonal6(theta_local.segment<6>(0));
+        const Eigen::Matrix<double, 6, 6> Q3 = diagonal6(theta_local.segment<6>(6));
+
+        Matrix18d Q = Matrix18d::Zero();
+        Q.block<6, 6>(0, 0) = dt3 * Q1;
+        Q.block<6, 6>(0, 12) = dt2 * Q1;
+        Q.block<6, 6>(6, 6) = dt * Q3;
+        Q.block<6, 6>(12, 0) = dt2 * Q1;
+        Q.block<6, 6>(12, 12) = dt * Q1;
+        return Q;
+    }
+
+    Matrix18d buildSpaceCovariance(const std::vector<Spacetime::SystemState<DTYPE>::Node>& local_nodes,
+                                   const Eigen::VectorXd& theta_local)
+    {
+        if (local_nodes.size() != 2 || theta_local.size() != 12)
+        {
+            throw std::runtime_error("buildSpaceCovariance expects two local nodes and a 12D parameter vector.");
+        }
+
+        const double ds = local_nodes[1].arclength - local_nodes[0].arclength;
+        const double ds2 = ds * ds / 2.0;
+        const double ds3 = ds * ds * ds / 3.0;
+
+        const Eigen::Matrix<double, 6, 6> Q2 = diagonal6(theta_local.segment<6>(0));
+        const Eigen::Matrix<double, 6, 6> Q3 = diagonal6(theta_local.segment<6>(6));
+        const Eigen::Matrix<double, 6, 6> varpihat = se3::curlyhat(local_nodes[0].varpi).template cast<double>();
+
+        Matrix18d Q = Matrix18d::Zero();
+        Q.block<6, 6>(0, 0) = ds3 * Q2;
+        Q.block<6, 6>(0, 6) = ds2 * Q2;
+        Q.block<6, 6>(0, 12) = -ds3 * Q2 * varpihat.transpose();
+        Q.block<6, 6>(6, 0) = ds2 * Q2;
+        Q.block<6, 6>(6, 6) = ds * Q2;
+        Q.block<6, 6>(6, 12) = -ds2 * Q2 * varpihat.transpose();
+        Q.block<6, 6>(12, 0) = -ds3 * varpihat * Q2;
+        Q.block<6, 6>(12, 6) = -ds2 * varpihat * Q2;
+        Q.block<6, 6>(12, 12) = ds * Q3 + ds3 * varpihat * Q2 * varpihat.transpose();
+        return Q;
+    }
+
+    Eigen::VectorXd finiteDifferenceGradient(const Eigen::VectorXd& theta0,
+                                             double epsilon,
+                                             const std::function<double(const Eigen::VectorXd&)>& objective)
+    {
+        Eigen::VectorXd gradient = Eigen::VectorXd::Zero(theta0.size());
+        for (int i = 0; i < theta0.size(); ++i)
+        {
+            const double step = epsilon * std::max(1.0, std::abs(theta0(i)));
+            Eigen::VectorXd theta_plus = theta0;
+            Eigen::VectorXd theta_minus = theta0;
+            theta_plus(i) += step;
+            theta_minus(i) = std::max(1e-12, theta_minus(i) - step);
+            gradient(i) = (objective(theta_plus) - objective(theta_minus)) / (theta_plus(i) - theta_minus(i));
+        }
+        return gradient;
+    }
+
+    void printGradientCheckSummary(const std::string& name,
+                                   const Eigen::VectorXd& analytic,
+                                   const Eigen::VectorXd& numeric)
+    {
+        if (analytic.size() != numeric.size())
+        {
+            throw std::runtime_error("Gradient check vectors have mismatched sizes.");
+        }
+
+        double max_abs_error = 0.0;
+        double max_rel_error = 0.0;
+        int worst_index = -1;
+        for (int i = 0; i < analytic.size(); ++i)
+        {
+            const double abs_error = std::abs(analytic(i) - numeric(i));
+            const double rel_error = abs_error / std::max(1e-10, std::abs(numeric(i)));
+            if (abs_error > max_abs_error)
+            {
+                max_abs_error = abs_error;
+                max_rel_error = rel_error;
+                worst_index = i;
+            }
+        }
+
+        std::cout << "Gradient FD check [" << name << "]: max_abs_error=" << max_abs_error
+                  << ", max_rel_error=" << max_rel_error
+                  << ", worst_index=" << worst_index << std::endl;
+    }
+
+    void runKernelFiniteDifferenceChecks(const Eigen::VectorXd& theta,
+                                         const FactorKernelSample& unary_sample,
+                                         const FactorKernelSample& time_sample,
+                                         const FactorKernelSample& space_sample,
+                                         double epsilon)
+    {
+        if (unary_sample.available)
+        {
+            const spacetime::FactorGradientContrib contrib = computeDiagonalFactorGradient(
+                unary_sample.e_f,
+                unary_sample.info_f,
+                unary_sample.E_f,
+                unary_sample.lambda_f,
+                unary_sample.e_nodes,
+                unary_sample.info_scale);
+            const Eigen::VectorXd analytic = contrib.dL_dtheta_state + contrib.dL_dtheta_info;
+
+            const Eigen::VectorXd theta_unary = theta.segment<18>(kP0Offset);
+            const Eigen::VectorXd a = unary_sample.E_f * unary_sample.lambda_f;
+            const Eigen::VectorXd b = unary_sample.e_f;
+            const Eigen::VectorXd c = unary_sample.E_f * unary_sample.e_nodes;
+
+            const auto objective = [&](const Eigen::VectorXd& theta_local) {
+                Eigen::MatrixXd info = theta_local.cwiseInverse().asDiagonal();
+                return (a.transpose() * info * b)(0, 0) - unary_sample.info_scale * (c.transpose() * info * c)(0, 0);
+            };
+
+            const Eigen::VectorXd numeric = finiteDifferenceGradient(theta_unary, epsilon, objective);
+            printGradientCheckSummary("unary", analytic, numeric);
+        }
+
+        if (time_sample.available)
+        {
+            const spacetime::FactorGradientContrib contrib = computeBinaryTimeFactorGradient(
+                time_sample.local_nodes,
+                time_sample.e_f,
+                time_sample.info_f,
+                time_sample.E_f,
+                time_sample.lambda_f,
+                time_sample.e_nodes,
+                time_sample.info_scale);
+            const Eigen::VectorXd analytic = contrib.dL_dtheta_state + contrib.dL_dtheta_info;
+
+            Eigen::VectorXd theta_time(12);
+            theta_time.segment<6>(0) = theta.segment<6>(kQ1Offset);
+            theta_time.segment<6>(6) = theta.segment<6>(kQ3Offset);
+            const Eigen::VectorXd a = time_sample.E_f * time_sample.lambda_f;
+            const Eigen::VectorXd b = time_sample.e_f;
+            const Eigen::VectorXd c = time_sample.E_f * time_sample.e_nodes;
+
+            const auto objective = [&](const Eigen::VectorXd& theta_local) {
+                const Matrix18d Q = buildTimeCovariance(time_sample.local_nodes, theta_local);
+                const Matrix18d info = Q.inverse();
+                return -(a.transpose() * info * b)(0, 0) - time_sample.info_scale * (c.transpose() * info * c)(0, 0);
+            };
+
+            const Eigen::VectorXd numeric = finiteDifferenceGradient(theta_time, epsilon, objective);
+            printGradientCheckSummary("time", analytic, numeric);
+        }
+
+        if (space_sample.available)
+        {
+            const spacetime::FactorGradientContrib contrib = computeBinarySpaceFactorGradient(
+                space_sample.local_nodes,
+                space_sample.e_f,
+                space_sample.info_f,
+                space_sample.E_f,
+                space_sample.lambda_f,
+                space_sample.e_nodes,
+                space_sample.info_scale);
+            const Eigen::VectorXd analytic = contrib.dL_dtheta_state + contrib.dL_dtheta_info;
+
+            Eigen::VectorXd theta_space(12);
+            theta_space.segment<6>(0) = theta.segment<6>(kQ2Offset);
+            theta_space.segment<6>(6) = theta.segment<6>(kQ3Offset);
+            const Eigen::VectorXd a = space_sample.E_f * space_sample.lambda_f;
+            const Eigen::VectorXd b = space_sample.e_f;
+            const Eigen::VectorXd c = space_sample.E_f * space_sample.e_nodes;
+
+            const auto objective = [&](const Eigen::VectorXd& theta_local) {
+                const Matrix18d Q = buildSpaceCovariance(space_sample.local_nodes, theta_local);
+                const Matrix18d info = Q.inverse();
+                return -(a.transpose() * info * b)(0, 0) - space_sample.info_scale * (c.transpose() * info * c)(0, 0);
+            };
+
+            const Eigen::VectorXd numeric = finiteDifferenceGradient(theta_space, epsilon, objective);
+            printGradientCheckSummary("space", analytic, numeric);
+        }
     }
 
     Eigen::Matrix<double, 18, 1> computeNodeValidationError(const Spacetime::SystemState<DTYPE>::Node &estimate,
@@ -537,6 +973,154 @@ namespace // anonymous
         e.template segment<6>(6) = (ground_truth.epsilon - estimate.epsilon).template cast<double>();
         e.template segment<6>(12) = (ground_truth.varpi - estimate.varpi).template cast<double>();
         return e;
+    }
+
+    struct TestProblemData
+    {
+        Spacetime::RobotTopology robot_topology;
+        Spacetime::Options estimator_options;
+        Eigen::VectorXd initial_theta;
+        std::vector<spacetime::OptimizationProblem::Node> nodes;
+        std::vector<std::shared_ptr<Spacetime::Factors::Factor>> factors;
+        std::vector<std::vector<int>> factor_node_indices;
+        std::vector<spacetime::ValidationTarget> validation_targets;
+        std::filesystem::path csv_path;
+    };
+
+    TestProblemData buildMinimalTestProblemData()
+    {
+        TestProblemData data;
+
+        const std::filesystem::path trial_config_path = resolveExistingPath({
+            "assets/config/trial/minimal.json",
+            "../assets/config/trial/minimal.json",
+            "../../assets/config/trial/minimal.json"
+        });
+        const std::filesystem::path robot_config_path = resolveExistingPath({
+            "assets/config/robot/minimal.json",
+            "../assets/config/robot/minimal.json",
+            "../../assets/config/robot/minimal.json"
+        });
+        const std::filesystem::path estimator_config_path = resolveExistingPath({
+            "assets/config/estimator/batch.json",
+            "../assets/config/estimator/batch.json",
+            "../../assets/config/estimator/batch.json"
+        });
+
+        const Json::Value trial_config = loadJsonFile(trial_config_path);
+        const Json::Value robot_config = loadJsonFile(robot_config_path);
+        const Json::Value estimator_config = loadJsonFile(estimator_config_path);
+
+        data.initial_theta = loadInitialThetaFromRobotConfig(robot_config);
+
+        loadRobotTopologyFromJson(robot_config, data.robot_topology);
+        loadTrialInitialConditionFromJson(trial_config, data.robot_topology);
+        const auto [trial_start_time, trial_end_time] = loadTrialTimeWindowFromJson(trial_config);
+        const auto validation_interval = trial_config["options"]["validation_interval"].asInt();
+
+        const std::filesystem::path repo_root = std::filesystem::absolute(trial_config_path)
+                                                    .parent_path()
+                                                    .parent_path()
+                                                    .parent_path()
+                                                    .parent_path();
+        const std::filesystem::path data_dir = repo_root / trial_config["data"]["folder_path"].asString();
+
+        for (const auto& entry : std::filesystem::directory_iterator(data_dir))
+        {
+            if (entry.is_regular_file() && entry.path().extension() == ".csv")
+            {
+                data.csv_path = entry.path();
+                break;
+            }
+        }
+
+        if (data.csv_path.empty())
+        {
+            throw std::runtime_error("No CSV file found in minimal data directory: " + data_dir.string());
+        }
+
+        const std::vector<std::vector<std::string>> csv_rows = readCsvRows(data.csv_path);
+        if (csv_rows.size() < 3)
+        {
+            throw std::runtime_error("Minimal CSV must contain at least one pose measurement row.");
+        }
+
+        Eigen::Matrix<double, 6, 6> pose_weight = Eigen::Matrix<double, 6, 6>::Zero();
+        for (int i = 0; i < 6; ++i)
+        {
+            pose_weight(i, i) = robot_config["weights"]["R_pose"][i].asDouble();
+        }
+
+        data.nodes.clear();
+        data.factors.clear();
+        data.factor_node_indices.clear();
+        data.validation_targets.clear();
+
+        for (size_t row_index = 2; row_index < csv_rows.size(); ++row_index)
+        {
+            const auto& row = csv_rows[row_index];
+            if (row.size() < 8)
+            {
+                continue;
+            }
+
+            const double row_time = std::stod(row[0]);
+            if (row_time < trial_start_time || row_time > trial_end_time)
+            {
+                continue;
+            }
+
+            spacetime::OptimizationProblem::Node node;
+            node.pose = data.robot_topology.T0;
+            node.epsilon = data.robot_topology.epsilon0;
+            node.varpi = data.robot_topology.varpi0;
+            node.arclength = std::stod(row[1]);
+            node.time = row_time;
+            data.nodes.push_back(node);
+
+            Spacetime::SensorMeasurement measurement;
+            measurement.type = Spacetime::SensorMeasurement::Pose;
+            measurement.mask = Eigen::Matrix<int, 6, 1>::Ones();
+            measurement.value = se3::vec2tran(parsePoseRow(row));
+            measurement.s = std::stod(row[1]);
+            measurement.t = node.time;
+
+            data.factors.push_back(std::make_shared<Spacetime::Factors::PoseMeasurementFactor>(pose_weight, measurement));
+            data.factor_node_indices.push_back({static_cast<int>(data.nodes.size() - 1)});
+
+            // Use a sparse subset of nodes as validation targets to exercise the upper-level loop.
+            if ((data.nodes.size() - 1) % validation_interval == 0)
+            {
+                spacetime::ValidationTarget target;
+                target.node_index = static_cast<int>(data.nodes.size() - 1);
+                target.ground_truth = node;
+                target.ground_truth.pose = measurement.value;
+                data.validation_targets.push_back(target);
+            }
+        }
+
+        if (data.nodes.empty())
+        {
+            throw std::runtime_error("No valid nodes were created from the minimal dataset.");
+        }
+        if (data.validation_targets.empty())
+        {
+            spacetime::ValidationTarget target;
+            target.node_index = 0;
+            target.ground_truth = data.nodes.front();
+            if (!data.factors.empty())
+            {
+                const auto pose_factor = std::dynamic_pointer_cast<Spacetime::Factors::PoseMeasurementFactor>(data.factors.front());
+                if (pose_factor)
+                {
+                    target.ground_truth.pose = pose_factor->getMeas().value;
+                }
+            }
+            data.validation_targets.push_back(target);
+        }
+
+        loadEstimatorOptionsFromJson(estimator_config, data.estimator_options);
+        return data;
     }
 }
 
@@ -664,6 +1248,7 @@ namespace spacetime {
             {
                 throw std::runtime_error("OptimizationProblem: solveLowerLevel expects measurement factors when delegating to Estimator::computeStateEstimate().");
             }
+            /*
             if (verbose)
             {
                 //Print factor information for debugging
@@ -673,7 +1258,7 @@ namespace spacetime {
                     auto value = m_meas.value;
                     std::cout << "Factor connects to node index: " << node_index << ", measurement value: " << value.transpose() << std::endl;
                 }
-            }
+            }*/
             measurement_factors.push_back(measurement_factor);
         }
 
@@ -767,7 +1352,7 @@ namespace spacetime {
         std::vector<Eigen::MatrixXd> factor_Qs;
         std::vector<std::vector<int>> factor_node_offsets;
         estimator.extractJacobianHessian(estimate.state, H_est, factor_errors, factor_jacobians, factor_Qs, factor_node_offsets);
-        
+        /*
         if(verbose)
         {
             std::cout << "Lower-level solution H matrix (sparse):" << std::endl;
@@ -779,6 +1364,7 @@ namespace spacetime {
                 }
             }
         }
+        */
         solution.H = H_est;
         Eigen::SparseMatrix<double> identity(solution.H.rows(), solution.H.cols());
         identity.setIdentity();
@@ -1013,7 +1599,7 @@ namespace spacetime {
         }
 
         //theta = exp(phi) if use_exponential_param is true, otherwise theta = phi
-        auto mapTheta = [&](const Eigen::VectorXd &unconstrained) {
+        auto mapTheta = [&](const Eigen::VectorXd &unconstrained) -> Eigen::VectorXd {
             if (optimizer_config.use_exponential_param)
             {
                 return unconstrained.array().exp().matrix();
@@ -1025,23 +1611,43 @@ namespace spacetime {
         const int validation_count = static_cast<int>(validation_targets.size());
         const double validation_scale = -1.0 / static_cast<double>(validation_count); //Scale factor for the gradient of the loss function with respect to the validation errors
 
+        //Main optimization loop
         for (int iter = 0; iter < optimizer_config.max_iterations; ++iter)
         {
             const Eigen::VectorXd theta = mapTheta(current_phi);
             problem_->setTheta(theta);
 
             const LowerLevelSolution solution = problem_->solveLowerLevel(optimizer_config.verbose);
-            const ValidationLossData validation = problem_->computeValidationLoss(solution);
-            
+            if (solution.H.rows() == 0)
+            {
+                throw std::runtime_error("Optimizer::step received an empty lower-level solution.");
+            }
+
+            const auto &solved_nodes = problem_->solvedNodes();
+            const auto &linearizations = solution.linearizations;
+            const auto &topology = problem_->robotTopology();
+
+            if (solved_nodes.empty() || topology.N == 0 || topology.K == 0)
+            {
+                throw std::runtime_error("Optimizer::step requires a solved topology with valid N and K.");
+            }
+
+            const MarginalCacheData marginal_cache = buildMarginalCache(solution.H, validation_targets);
+            const ValidationLossData validation = computeValidationLossWithMarginals(validation_targets, solved_nodes, marginal_cache);
+            const Eigen::VectorXd adjoint_rhs = computeAdjointRhsWithMarginals(solution.H, validation_targets, validation, marginal_cache);
+            for (size_t i=0; i<theta.size(); ++i){
+                std::cout << "Theta[" << i << "] = " << theta[i] << std::endl;
+            }
+            std::cout << "Validation mean NEES = " << validation.mean_nees << std::endl;
+            std::cout << "Validation loss = " << validation.loss << std::endl;
             if(optimizer_config.verbose){
-                for (size_t i=0; i<theta.size(); ++i){
-                    std::cout << "Theta[" << i << "] = " << theta[i] << std::endl;
-                }
                 for (size_t i=0; i<validation.nees_per_node.size(); ++i){
                     std::cout << "Validation NEES[" << i << "] = " << validation.nees_per_node[i] << std::endl;
                 }
-                std::cout << "Validation mean NEES = " << validation.mean_nees << std::endl;
-                std::cout << "Validation loss = " << validation.loss << std::endl
+
+                std::cout << "Marginal cache profile: nodes=" << marginal_cache.node_information_blocks.size()
+                          << ", factorization_ms=" << marginal_cache.factorization_ms
+                          << ", solve_ms=" << marginal_cache.marginal_solve_ms << std::endl;
             }
 
             result.loss = validation.loss;
@@ -1049,12 +1655,6 @@ namespace spacetime {
             result.phi = current_phi;
             result.theta = theta;
 
-            if (solution.H.rows() == 0)
-            {
-                throw std::runtime_error("Optimizer::step received an empty lower-level solution.");
-            }
-
-            const Eigen::VectorXd adjoint_rhs = problem_->computeAdjointRhs(solution, validation);
             Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> adjoint_solver;
             adjoint_solver.compute(solution.H);
             if (adjoint_solver.info() != Eigen::Success)
@@ -1066,15 +1666,6 @@ namespace spacetime {
             if (adjoint_solver.info() != Eigen::Success)
             {
                 throw std::runtime_error("Optimizer::step failed to solve the adjoint system.");
-            }
-
-            const auto &solved_nodes = problem_->solvedNodes();
-            const auto &linearizations = solution.linearizations;
-            const auto &topology = problem_->robotTopology();
-
-            if (solved_nodes.empty() || topology.N == 0 || topology.K == 0)
-            {
-                throw std::runtime_error("Optimizer::step requires a solved topology with valid N and K.");
             }
 
             const std::size_t unary_count = static_cast<std::size_t>(topology.K);
@@ -1100,6 +1691,9 @@ namespace spacetime {
             }
 
             Eigen::VectorXd dL_dtheta = Eigen::VectorXd::Zero(kThetaSize);
+            FactorKernelSample unary_sample;
+            FactorKernelSample time_sample;
+            FactorKernelSample space_sample;
 
             // Compute the gradient contributions from each built-in factor type
             for (std::size_t i = 0; i < built_in_count; ++i)
@@ -1128,24 +1722,86 @@ namespace spacetime {
                     e_nodes.segment<18>(static_cast<int>(j) * 18) = global_validation_errors.segment<18>(node_index * 18);
                 }
 
-                if (i < unary_count)
+                if (lin.node_indices.size() == 1)
                 {
+                    // If the unary sample is not yet available, store the first one for gradient checking
+                    if (!unary_sample.available)
+                    {
+                        unary_sample.available = true;
+                        unary_sample.local_nodes = local_nodes;
+                        unary_sample.e_f = lin.e;
+                        unary_sample.info_f = lin.Q;
+                        unary_sample.E_f = lin.E;
+                        unary_sample.lambda_f = lambda_f;
+                        unary_sample.e_nodes = e_nodes;
+                        unary_sample.info_scale = validation_scale * validation.delta;
+                    }
                     const FactorGradientContrib contrib = computeDiagonalFactorGradient(lin.e, lin.Q, lin.E, lambda_f, e_nodes, validation_scale * validation.delta);
                     dL_dtheta.segment<18>(0) += contrib.dL_dtheta_state + contrib.dL_dtheta_info;
                     continue;
                 }
 
-                if (i < unary_count + binary_space_count)
+                if (lin.node_indices.size() != 2)
                 {
+                    throw std::runtime_error("Optimizer::step: built-in factor must involve either one node (unary) or two nodes (binary).");
+                }
+
+                const auto &node0 = local_nodes[0];
+                const auto &node1 = local_nodes[1];
+                const bool same_time = std::abs(node1.time - node0.time) < TOLERANCE;
+                const bool same_arclength = std::abs(node1.arclength - node0.arclength) < TOLERANCE;
+
+                if (same_time && !same_arclength)
+                {
+                    // If the space sample is not yet available, store the first one for gradient checking
+                    if (!space_sample.available)
+                    {
+                        space_sample.available = true;
+                        space_sample.local_nodes = local_nodes;
+                        space_sample.e_f = lin.e;
+                        space_sample.info_f = lin.Q;
+                        space_sample.E_f = lin.E;
+                        space_sample.lambda_f = lambda_f;
+                        space_sample.e_nodes = e_nodes;
+                        space_sample.info_scale = validation_scale * validation.delta;
+                    }
                     const FactorGradientContrib contrib = computeBinarySpaceFactorGradient(local_nodes, lin.e, lin.Q, lin.E, lambda_f, e_nodes, validation_scale * validation.delta);
-                    dL_dtheta.segment<6>(24) += contrib.dL_dtheta_state.segment<6>(0) + contrib.dL_dtheta_info.segment<6>(0);
-                    dL_dtheta.segment<6>(30) += contrib.dL_dtheta_state.segment<6>(6) + contrib.dL_dtheta_info.segment<6>(6);
+                    dL_dtheta.segment<6>(24) += contrib.dL_dtheta_state.segment<6>(0) + contrib.dL_dtheta_info.segment<6>(0); // Q2
+                    dL_dtheta.segment<6>(30) += contrib.dL_dtheta_state.segment<6>(6) + contrib.dL_dtheta_info.segment<6>(6); // Q3
                     continue;
                 }
 
-                const FactorGradientContrib contrib = computeBinaryTimeFactorGradient(local_nodes, lin.e, lin.Q, lin.E, lambda_f, e_nodes, validation_scale * validation.delta);
-                dL_dtheta.segment<6>(18) += contrib.dL_dtheta_state.segment<6>(0) + contrib.dL_dtheta_info.segment<6>(0);
-                dL_dtheta.segment<6>(30) += contrib.dL_dtheta_state.segment<6>(6) + contrib.dL_dtheta_info.segment<6>(6);
+                if (!same_time && same_arclength)
+                {
+                    if (!time_sample.available)
+                    {
+                        time_sample.available = true;
+                        time_sample.local_nodes = local_nodes;
+                        time_sample.e_f = lin.e;
+                        time_sample.info_f = lin.Q;
+                        time_sample.E_f = lin.E;
+                        time_sample.lambda_f = lambda_f;
+                        time_sample.e_nodes = e_nodes;
+                        time_sample.info_scale = validation_scale * validation.delta;
+                    }
+
+                    const FactorGradientContrib contrib = computeBinaryTimeFactorGradient(local_nodes, lin.e, lin.Q, lin.E, lambda_f, e_nodes, validation_scale * validation.delta);
+                    dL_dtheta.segment<6>(18) += contrib.dL_dtheta_state.segment<6>(0) + contrib.dL_dtheta_info.segment<6>(0); // Q1
+                    dL_dtheta.segment<6>(30) += contrib.dL_dtheta_state.segment<6>(6) + contrib.dL_dtheta_info.segment<6>(6); // Q3
+                    continue;
+                }
+
+                throw std::runtime_error("Optimizer::step: could not classify built-in binary factor as space or time from node coordinates.");
+            }
+
+            if (optimizer_config.enable_gradient_fd_check && iter == 0)
+            {
+                runKernelFiniteDifferenceChecks(
+                    theta,
+                    unary_sample,
+                    time_sample,
+                    space_sample,
+                    optimizer_config.gradient_fd_epsilon);
             }
 
             Eigen::VectorXd dL_dphi = dL_dtheta;
@@ -1182,6 +1838,7 @@ namespace spacetime {
         return result;
     }
 
+    //Solve adjoint H * lambda = b using Eigen's SimplicialLDLT solver for sparse matrices.
     Eigen::VectorXd AdjointSolver::solve(const Eigen::SparseMatrix<double>& H,
                                   const Eigen::VectorXd& b) {
         Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
@@ -1194,122 +1851,20 @@ namespace spacetime {
 
 }
 
-int main(int argc, char** argv)
+int TestLower()
 {
-    std::cout << "Bilevel Optimizer Test" << std::endl;
-
-    // Load minimal trial and robot configuration files
-    const std::filesystem::path trial_config_path = resolveExistingPath({
-        "assets/config/trial/minimal.json",
-        "../assets/config/trial/minimal.json",
-        "../../assets/config/trial/minimal.json"
-    });
-    const std::filesystem::path robot_config_path = resolveExistingPath({
-        "assets/config/robot/minimal.json",
-        "../assets/config/robot/minimal.json",
-        "../../assets/config/robot/minimal.json"
-    });
-    const std::filesystem::path estimator_config_path = resolveExistingPath({
-        "assets/config/estimator/batch.json",
-        "../assets/config/estimator/batch.json",
-        "../../assets/config/estimator/batch.json"
-    });
-
-    const Json::Value trial_config = loadJsonFile(trial_config_path);
-    const Json::Value robot_config = loadJsonFile(robot_config_path);
-    const Json::Value estimator_config = loadJsonFile(estimator_config_path);
-
-    Spacetime::RobotTopology robot_topology;
-    loadRobotTopologyFromJson(robot_config, robot_topology);
-    loadTrialInitialConditionFromJson(trial_config, robot_topology);
-    const auto [trial_start_time, trial_end_time] = loadTrialTimeWindowFromJson(trial_config);
-
-    const std::filesystem::path repo_root = std::filesystem::absolute(trial_config_path)
-                                                .parent_path()
-                                                .parent_path()
-                                                .parent_path()
-                                                .parent_path();
-    const std::filesystem::path data_dir = repo_root / trial_config["data"]["folder_path"].asString();
-
-    // Find the first CSV file in the data directory
-    std::filesystem::path csv_path;
-    for (const auto& entry : std::filesystem::directory_iterator(data_dir))
-    {
-        if (entry.is_regular_file() && entry.path().extension() == ".csv")
-        {
-            csv_path = entry.path();
-            break;
-        }
-    }
-
-    if (csv_path.empty())
-    {
-        throw std::runtime_error("No CSV file found in minimal data directory: " + data_dir.string());
-    }
-
-    const std::vector<std::vector<std::string>> csv_rows = readCsvRows(csv_path);
-    if (csv_rows.size() < 3)
-    {
-        throw std::runtime_error("Minimal CSV must contain at least one pose measurement row.");
-    }
-
-    Eigen::Matrix<double, 6, 6> pose_weight = Eigen::Matrix<double, 6, 6>::Zero();
-    for (int i = 0; i < 6; ++i)
-    {
-        pose_weight(i, i) = robot_config["weights"]["R_pose"][i].asDouble();
-    }
-
-    // Build the lower-level optimization problem from the CSV data
-    std::vector<spacetime::OptimizationProblem::Node> nodes;
-    std::vector<std::shared_ptr<Spacetime::Factors::Factor>> factors;
-    std::vector<std::vector<int>> factor_node_indices;
-
-    for (size_t row_index = 2; row_index < csv_rows.size(); ++row_index)
-    {
-        const auto& row = csv_rows[row_index];
-        if (row.size() < 8)
-        {
-            continue;
-        }
-
-        const double row_time = std::stod(row[0]);
-        if (row_time < trial_start_time || row_time > trial_end_time)
-        {
-            continue;
-        }
-
-        spacetime::OptimizationProblem::Node node;
-        node.pose = robot_topology.T0;
-        node.epsilon = robot_topology.epsilon0;
-        node.varpi = robot_topology.varpi0;
-        node.arclength = std::stod(row[1]);
-        node.time = row_time;
-        nodes.push_back(node);
-
-        Spacetime::SensorMeasurement measurement;
-        measurement.type = Spacetime::SensorMeasurement::Pose;
-        measurement.mask = Eigen::Matrix<int, 6, 1>::Ones();
-        measurement.value = se3::vec2tran(parsePoseRow(row));
-        measurement.s = std::stod(row[1]);
-        measurement.t = node.time;
-
-        factors.push_back(std::make_shared<Spacetime::Factors::PoseMeasurementFactor>(pose_weight, measurement));
-        factor_node_indices.push_back({static_cast<int>(nodes.size() - 1)});
-    }
-
+    std::cout << "Lower-level optimizer test" << std::endl;
+    const TestProblemData data = buildMinimalTestProblemData();
 
     spacetime::OptimizationProblem problem;
-    Spacetime::Options estimator_options;
-    loadEstimatorOptionsFromJson(estimator_config, estimator_options);
-    problem.setEstimatorOptions(estimator_options);
-    problem.setRobotTopology(robot_topology);
-    problem.setTheta(Eigen::VectorXd::Ones(36));
-    problem.setProblemData(nodes, factors, factor_node_indices);
-    //solve
+    problem.setEstimatorOptions(data.estimator_options);
+    problem.setRobotTopology(data.robot_topology);
+    problem.setTheta(data.initial_theta);
+    problem.setProblemData(data.nodes, data.factors, data.factor_node_indices);
+
     const auto result = problem.solveLowerLevel(true);
-    //print
-    std::cout << "Lower-level problem built from " << nodes.size() << " pose examples loaded from " << csv_path.string() << std::endl;
-    std::cout << "Factors: " << factors.size() << std::endl;
+    std::cout << "Lower-level problem built from " << data.nodes.size() << " pose examples loaded from " << data.csv_path.string() << std::endl;
+    std::cout << "Factors: " << data.factors.size() << std::endl;
     std::cout << "H size: " << result.H.rows() << " x " << result.H.cols() << std::endl;
     std::cout << "dx norm: " << result.x.norm() << std::endl;
     std::cout << "Linearizations: " << result.linearizations.size() << std::endl;
@@ -1322,5 +1877,50 @@ int main(int argc, char** argv)
     {
         std::cout << "dx[" << i << "] = " << result.x[i] << std::endl;
     }
+
+    return 0;
+}
+
+int main(int argc, char** argv)
+{
+    if (argc > 1)
+    {
+        const std::string mode = argv[1];
+        if (mode == "--lower")
+        {
+            return TestLower();
+        }
+    }
+
+    std::cout << "Upper-level optimizer test" << std::endl;
+
+    const TestProblemData data = buildMinimalTestProblemData();
+
+    const std::filesystem::path bilevel_config_path = resolveExistingPath({
+        "assets/config/bilevel_optimizer/bilevel_config.json",
+        "../assets/config/bilevel_optimizer/bilevel_config.json",
+        "../../assets/config/bilevel_optimizer/bilevel_config.json"
+    });
+    const Json::Value bilevel_config = loadJsonFile(bilevel_config_path);
+
+    spacetime::OptimizationProblem problem;
+    problem.setEstimatorOptions(data.estimator_options);
+    problem.setRobotTopology(data.robot_topology);
+    problem.setTheta(data.initial_theta);
+    problem.setProblemData(data.nodes, data.factors, data.factor_node_indices);
+    problem.setValidationTargets(data.validation_targets);
+
+    spacetime::Optimizer optimizer(problem);
+    spacetime::Optimizer::OptimizerConfig config;
+    loadBilevelOptimizerConfigFromJson(bilevel_config, config);
+    optimizer.setConfig(config);
+
+    const spacetime::Optimizer::Result result = optimizer.optimize();
+    std::cout << "Upper-level optimization finished" << std::endl;
+    std::cout << "Converged: " << (result.converged ? "true" : "false") << std::endl;
+    std::cout << "Iterations: " << result.iterations << std::endl;
+    std::cout << "Final loss: " << result.loss << std::endl;
+    std::cout << "Theta min/max: " << result.theta.minCoeff() << " / " << result.theta.maxCoeff() << std::endl;
+
     return 0;
 }

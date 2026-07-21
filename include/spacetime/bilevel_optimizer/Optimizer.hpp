@@ -23,6 +23,8 @@ public:
         double tol_loss = 1e-5;
         bool use_exponential_param = true; // if true, theta = exp(phi)
         bool verbose = false; // if true, print debug info
+        bool enable_gradient_fd_check = false; // if true, run factor-kernel finite-difference checks on iteration 0
+        double gradient_fd_epsilon = 1e-6; // central-difference epsilon for gradient checks
     } optimizer_config;
     std::shared_ptr<OptimizationProblem> problem_;
     Optimizer(const OptimizationProblem& problem);
