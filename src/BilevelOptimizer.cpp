@@ -241,6 +241,22 @@ namespace // anonymous
         {
             config.learning_rate = root["learning_rate"].asDouble();
         }
+        if (root.isMember("use_adam"))
+        {
+            config.use_adam = root["use_adam"].asBool();
+        }
+        if (root.isMember("adam_beta1"))
+        {
+            config.adam_beta1 = root["adam_beta1"].asDouble();
+        }
+        if (root.isMember("adam_beta2"))
+        {
+            config.adam_beta2 = root["adam_beta2"].asDouble();
+        }
+        if (root.isMember("adam_epsilon"))
+        {
+            config.adam_epsilon = root["adam_epsilon"].asDouble();
+        }
         if (root.isMember("tol_grad"))
         {
             config.tol_grad = root["tol_grad"].asDouble();
@@ -621,6 +637,7 @@ namespace // anonymous
                                                                        int node_index)
     {
         constexpr int node_dim = 18;
+        constexpr double kMarginalCovarianceFloor = 1e-4;
         const int start = node_index * node_dim;
 
         Eigen::MatrixXd rhs = Eigen::MatrixXd::Zero(total_dim, node_dim);
@@ -634,6 +651,16 @@ namespace // anonymous
 
         Eigen::Matrix<double, 18, 18> marginal_cov = solved_columns.block(start, 0, node_dim, node_dim);
         marginal_cov = 0.5 * (marginal_cov + marginal_cov.transpose());
+
+        // Stabilize inversion by flooring tiny/negative modes in the marginal covariance block.
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 18, 18>> eigensolver(marginal_cov);
+        if (eigensolver.info() != Eigen::Success)
+        {
+            throw std::runtime_error("Failed to eigendecompose node marginal covariance block.");
+        }
+        Eigen::Matrix<double, 18, 1> eigenvalues = eigensolver.eigenvalues();
+        eigenvalues = eigenvalues.array().max(kMarginalCovarianceFloor);
+        marginal_cov = eigensolver.eigenvectors() * eigenvalues.asDiagonal() * eigensolver.eigenvectors().transpose();
 
         Eigen::MatrixXd identity = Eigen::MatrixXd::Identity(18, 18);
         return solvePositiveDefiniteSystem(marginal_cov, identity);
@@ -1241,12 +1268,29 @@ namespace spacetime {
 
         std::vector<std::shared_ptr<Spacetime::Factors::MeasurementFactor>> measurement_factors;
         measurement_factors.reserve(factors_.size());
-        for (const auto &factor : factors_)
+        for (std::size_t factor_idx = 0; factor_idx < factors_.size(); ++factor_idx)
         {
+            const auto &factor = factors_[factor_idx];
             auto measurement_factor = std::dynamic_pointer_cast<Spacetime::Factors::MeasurementFactor>(factor);
             if (!measurement_factor)
             {
                 throw std::runtime_error("OptimizationProblem: solveLowerLevel expects measurement factors when delegating to Estimator::computeStateEstimate().");
+            }
+
+            // Route measurement factors to the user-provided node assignment when available.
+            measurement_factor->setRoutedNodeIndex(-1);
+            if (!factor_node_indices_.empty() && factor_idx < factor_node_indices_.size())
+            {
+                const auto &assigned_nodes = factor_node_indices_[factor_idx];
+                if (!assigned_nodes.empty())
+                {
+                    const int node_index = assigned_nodes.front();
+                    if (node_index < 0 || node_index >= static_cast<int>(nodes_.size()))
+                    {
+                        throw std::runtime_error("OptimizationProblem: factor_node_indices contains an out-of-range node index.");
+                    }
+                    measurement_factor->setRoutedNodeIndex(node_index);
+                }
             }
             /*
             if (verbose)
@@ -1454,7 +1498,7 @@ namespace spacetime {
         }
 
         out.mean_nees = out.nees_per_node.mean();
-        out.delta = out.mean_nees - 18.0;
+        out.delta = out.mean_nees - 18; 
         out.loss = 0.5 * out.delta * out.delta;
         return out;
     }
@@ -1610,6 +1654,10 @@ namespace spacetime {
         double previous_loss = std::numeric_limits<double>::infinity();
         const int validation_count = static_cast<int>(validation_targets.size());
         const double validation_scale = -1.0 / static_cast<double>(validation_count); //Scale factor for the gradient of the loss function with respect to the validation errors
+        Eigen::VectorXd adam_m = Eigen::VectorXd::Zero(current_phi.size());
+        Eigen::VectorXd adam_v = Eigen::VectorXd::Zero(current_phi.size());
+        double beta1_power = 1.0;
+        double beta2_power = 1.0;
 
         //Main optimization loop
         for (int iter = 0; iter < optimizer_config.max_iterations; ++iter)
@@ -1641,8 +1689,27 @@ namespace spacetime {
             std::cout << "Validation mean NEES = " << validation.mean_nees << std::endl;
             std::cout << "Validation loss = " << validation.loss << std::endl;
             if(optimizer_config.verbose){
-                for (size_t i=0; i<validation.nees_per_node.size(); ++i){
-                    std::cout << "Validation NEES[" << i << "] = " << validation.nees_per_node[i] << std::endl;
+                for (int i = 0; i < validation_count; ++i)
+                {
+                    const int node_index = validation_targets[static_cast<std::size_t>(i)].node_index;
+                    const Eigen::VectorXd e = validation.node_errors_stacked.segment<18>(i * 18);
+                    const Matrix18d &p_inv_block = getCachedNodeInformationBlock(marginal_cache, node_index);
+
+                    const double pose_norm = e.segment<6>(0).norm();
+                    const double strain_norm = e.segment<6>(6).norm();
+                    const double varpi_norm = e.segment<6>(12).norm();
+                    const double residual_norm = e.norm();
+                    const double info_trace = p_inv_block.trace();
+
+                    std::cout << "Validation target " << i
+                              << " (node=" << node_index << ")"
+                              << ": NEES=" << validation.nees_per_node(i)
+                              << ", ||e||=" << residual_norm
+                              << ", ||e_pose||=" << pose_norm
+                              << ", ||e_strain||=" << strain_norm
+                              << ", ||e_varpi||=" << varpi_norm
+                              << ", trace(P_inv)=" << info_trace
+                              << std::endl;
                 }
 
                 std::cout << "Marginal cache profile: nodes=" << marginal_cache.node_information_blocks.size()
@@ -1820,6 +1887,10 @@ namespace spacetime {
                           << ", theta_min=" << theta.minCoeff()
                           << ", theta_max=" << theta.maxCoeff()
                           << std::endl;
+                for (size_t i = 0; i < dL_dphi.size(); ++i)
+                {
+                    std::cout << "dL/dphi[" << i << "] = " << dL_dphi[i] << ", dL/dtheta[" << i << "] = " << dL_dtheta[i] << std::endl; 
+                }
             }
 
             if (grad_norm < optimizer_config.tol_grad || std::abs(previous_loss - validation.loss) < optimizer_config.tol_loss)
@@ -1828,7 +1899,25 @@ namespace spacetime {
                 break;
             }
 
-            current_phi = current_phi - optimizer_config.learning_rate * dL_dphi;
+            if (optimizer_config.use_adam)
+            {
+                adam_m = optimizer_config.adam_beta1 * adam_m + (1.0 - optimizer_config.adam_beta1) * dL_dphi;
+                adam_v = optimizer_config.adam_beta2 * adam_v + (1.0 - optimizer_config.adam_beta2) * dL_dphi.array().square().matrix();
+                beta1_power *= optimizer_config.adam_beta1;
+                beta2_power *= optimizer_config.adam_beta2;
+
+                const double inv_one_minus_beta1_power = 1.0 / (1.0 - beta1_power);
+                const double inv_one_minus_beta2_power = 1.0 / (1.0 - beta2_power);
+                const Eigen::VectorXd m_hat = adam_m * inv_one_minus_beta1_power;
+                const Eigen::VectorXd v_hat = adam_v * inv_one_minus_beta2_power;
+                const Eigen::VectorXd adam_step = m_hat.array() / (v_hat.array().sqrt() + optimizer_config.adam_epsilon);
+
+                current_phi = current_phi - optimizer_config.learning_rate * adam_step;
+            }
+            else
+            {
+                current_phi = current_phi - optimizer_config.learning_rate * dL_dphi;
+            }
             previous_loss = validation.loss;
         }
 

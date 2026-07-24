@@ -1,10 +1,14 @@
 {
-    "max_iterations": 200,
-    "learning_rate": 5e-4,
-    "tol_grad": 1e-5,
-    "tol_loss": 1e-3,
+    "max_iterations": 400,
+    "learning_rate": 5e-2,
+    "use_adam": true,
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.999,
+    "adam_epsilon": 1e-8,
+    "tol_grad": 1e-6,
+    "tol_loss": 1e-6,
     "use_exponential_param": true,
     "verbose": true,
-    "enable_gradient_fd_check": false,
+    "enable_gradient_fd_check": true,
     "gradient_fd_epsilon": 1e-6
-}
+}  

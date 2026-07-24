@@ -414,6 +414,56 @@ namespace Spacetime
         // Returns true if measurement factor was included, false if it was skipped (e.g., out of time bounds)
         const auto &measurement = p_factor->getMeas();
 
+        const int routed_node_index = p_factor->getRoutedNodeIndex();
+        if (routed_node_index >= 0)
+        {
+            if (routed_node_index >= static_cast<int>(state.estimation_nodes.size()))
+            {
+                throw std::runtime_error("assembleMeasurementTerm: routed node index is out of bounds.");
+            }
+
+            const SystemState<DTYPE>::Node &node = state.estimation_nodes[static_cast<std::size_t>(routed_node_index)];
+
+            if (cost_only)
+            {
+                cost += p_factor->getCost(std::vector({node}));
+                return true;
+            }
+
+            Eigen::VectorX<DTYPE> e;
+            Eigen::MatrixX<double> S;
+            if (m_options.use_autodiff)
+            {
+                S = p_factor->Factor::getJacobian({node}, e);
+            }
+            else
+            {
+                S = p_factor->getJacobian({node}, e);
+            }
+            p_factor->setOperatingPoint(node);
+
+            cost += p_factor->getCost(e);
+            const Eigen::MatrixX<double> weight = p_factor->getWeight().cast<double>();
+            const Eigen::MatrixX<double> A_block = S.transpose() * weight * S;
+            const Eigen::MatrixX<double> b_block = -S.transpose() * weight * e.cast<double>();
+
+            const unsigned int node_linear_index = static_cast<unsigned int>(routed_node_index);
+            const unsigned int idx_base = getOptimizationIndex(node_linear_index % topology.N, node_linear_index / topology.N, topology);
+
+            for (int row_block = 0; row_block < A_block.rows(); ++row_block)
+            {
+                const unsigned int idx_row = idx_base + static_cast<unsigned int>(row_block);
+                for (int col_block = 0; col_block < A_block.cols(); ++col_block)
+                {
+                    const unsigned int idx_col = idx_base + static_cast<unsigned int>(col_block);
+                    A_tripletList.emplace_back(idx_row, idx_col, A_block(row_block, col_block));
+                }
+                b_tripletList.emplace_back(idx_row, 0, b_block(row_block, 0));
+            }
+
+            return true;
+        }
+
         if (measurement.t < state.estimation_nodes.front().time - TOLERANCE || measurement.t >= state.estimation_nodes.back().time - TOLERANCE)
             return false; // Measurement is outside of time bounds of estimation. Range is [first state time, last state time)
         if (!m_options.interpolate_measurements)
@@ -1449,7 +1499,7 @@ namespace Spacetime
             b_tripletList.clear();
             A.resize(18 * total_nodes, 18 * total_nodes);
             b.resize(18 * total_nodes, 1);
-            /*
+            
             if(verbose_mode)
             {
                 std::cout << "A size: " << A.rows() << " x " << A.cols() << std::endl;
@@ -1473,7 +1523,7 @@ namespace Spacetime
                     }
                 }
             }
-            */
+            
             // Assemble prior terms
             DTYPE cost_p = 0.0;
             assemblePriorTerms(A_tripletList, b_tripletList, cost_p, results.state, m_robot_topology, false);
@@ -1606,14 +1656,14 @@ namespace Spacetime
             {
                 updateStateVariables(results.state, dx);
             }
-            /*
+            
             if(verbose_mode)
             {
                 for (unsigned int i = 0; i < dx.size(); i++)
                 {
                     std::cout << "dx[" << i << "] = " << dx[i] << std::endl;
                 }                
-            }*/
+            }
 
             // Check if the cost during the last couple iterations are still changing
             bool detect_convergence = false;

@@ -27,6 +27,6 @@
         "interpolate_measurements": true,
         "compute_covariances": false,
         "extract_from_front": false,
-        "validation_interval": 50
+        "validation_interval": 1
     }
 }

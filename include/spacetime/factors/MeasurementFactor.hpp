@@ -24,6 +24,8 @@ namespace Spacetime::Factors
         const Spacetime::SensorMeasurement &getMeas() const { return m_meas; }
         const Node &getOperatingPoint() const { return operating_point; }
         void setOperatingPoint(const Node &node) const { operating_point = node; }
+        int getRoutedNodeIndex() const { return routed_node_index; }
+        void setRoutedNodeIndex(int node_index) const { routed_node_index = node_index; }
 
     protected:
         const Spacetime::SensorMeasurement m_meas;
@@ -31,6 +33,7 @@ namespace Spacetime::Factors
 
     private: 
         mutable SystemState<DTYPE>::Node operating_point;
+        mutable int routed_node_index = -1;
     };
 }
 #endif // MEASUREMENTFACTOR_H

@@ -19,6 +19,10 @@ public:
     struct OptimizerConfig {
         int max_iterations = 100;
         double learning_rate = 0.01;
+        bool use_adam = true;
+        double adam_beta1 = 0.9;
+        double adam_beta2 = 0.999;
+        double adam_epsilon = 1e-8;
         double tol_grad = 1e-5;
         double tol_loss = 1e-5;
         bool use_exponential_param = true; // if true, theta = exp(phi)
