@@ -27,6 +27,9 @@
         "interpolate_measurements": true,
         "compute_covariances": false,
         "extract_from_front": false,
-        "validation_interval": 1
+        "validation_interval": 1,
+        "prior_only_ground_truth_mode": true,
+        "validation_sample_count": 10,
+        "validation_rng_seed": 7 // Original seed is 7
     }
 }

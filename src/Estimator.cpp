@@ -1656,7 +1656,7 @@ namespace Spacetime
             {
                 updateStateVariables(results.state, dx);
             }
-            
+            /*
             if(verbose_mode)
             {
                 for (unsigned int i = 0; i < dx.size(); i++)
@@ -1664,7 +1664,7 @@ namespace Spacetime
                     std::cout << "dx[" << i << "] = " << dx[i] << std::endl;
                 }                
             }
-
+            */
             // Check if the cost during the last couple iterations are still changing
             bool detect_convergence = false;
             if (verbose_mode)
@@ -1955,6 +1955,52 @@ namespace Spacetime
         {
             const auto &p_factor = m_measurement_factors[i];
             const auto &measurement = p_factor->getMeas();
+
+            const int routed_node_index = p_factor->getRoutedNodeIndex();
+            if (routed_node_index >= 0)
+            {
+                if (routed_node_index >= static_cast<int>(state.estimation_nodes.size()))
+                {
+                    throw std::runtime_error("extractJacobianHessian: routed node index is out of bounds.");
+                }
+
+                const SystemState<DTYPE>::Node &node = state.estimation_nodes[static_cast<std::size_t>(routed_node_index)];
+
+                Eigen::VectorX<DTYPE> e;
+                Eigen::MatrixX<double> S;
+                if (m_options.use_autodiff)
+                {
+                    S = p_factor->Factor::getJacobian({node}, e);
+                }
+                else
+                {
+                    S = p_factor->getJacobian({node}, e);
+                }
+                p_factor->setOperatingPoint(node);
+
+                Eigen::MatrixX<double> weight = p_factor->getWeight().cast<double>();
+                Eigen::MatrixX<double> A_block = S.transpose() * weight * S;
+
+                const unsigned int node_linear_index = static_cast<unsigned int>(routed_node_index);
+                const unsigned int idx_base = getOptimizationIndex(node_linear_index % m_robot_topology.N, node_linear_index / m_robot_topology.N, m_robot_topology);
+
+                // Store linearization exactly at the routed node so H matches solve-time routing.
+                factor_errors.push_back(e.template cast<double>());
+                factor_jacobians.push_back(S);
+                factor_Qs.push_back(weight);
+                factor_node_indices.push_back({static_cast<int>(idx_base)});
+
+                for (int row_block = 0; row_block < A_block.rows(); ++row_block)
+                {
+                    const unsigned int idx_row = idx_base + static_cast<unsigned int>(row_block);
+                    for (int col_block = 0; col_block < A_block.cols(); ++col_block)
+                    {
+                        const unsigned int idx_col = idx_base + static_cast<unsigned int>(col_block);
+                        A_tripletList.emplace_back(idx_row, idx_col, A_block(row_block, col_block));
+                    }
+                }
+                continue;
+            }
 
             if (measurement.t < state.estimation_nodes.front().time - TOLERANCE)
                 continue;

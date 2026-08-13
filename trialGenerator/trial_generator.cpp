@@ -39,6 +39,7 @@ int main(int argc, char** argv){
     std::normal_distribution<double> noise_dist(0.0, noise_stddev);
     std::normal_distribution<double> measurement_dist(0.0, measurement_stddev);
     std::default_random_engine generator;
+    generator.seed(42); // Fixed seed for reproducibility
     double current_vals[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     for(double t=0.0; t<time_window; t+=time_step){
         for(double s=0.0; s<arclength_end; s+=arclength_step){

@@ -1,14 +1,19 @@
 {
-    "max_iterations": 400,
-    "learning_rate": 5e-2,
-    "use_adam": true,
+    "max_iterations": 10000,
+    "learning_rate": 1e0,
+    "use_adam": false,
     "adam_beta1": 0.9,
     "adam_beta2": 0.999,
     "adam_epsilon": 1e-8,
-    "tol_grad": 1e-6,
-    "tol_loss": 1e-6,
+    "tol_grad": 1e-5,
+    "tol_loss": 1e-10,
     "use_exponential_param": true,
+    "freeze_p0_non_pose": false,
     "verbose": true,
     "enable_gradient_fd_check": true,
-    "gradient_fd_epsilon": 1e-6
+    "gradient_fd_epsilon": 1e-6,
+    "max_gradient_update_norm": 1e4,
+    "max_phi_step_norm": 2e-1,
+    "min_theta": 1e-12,
+    "max_theta": 1e3
 }  
