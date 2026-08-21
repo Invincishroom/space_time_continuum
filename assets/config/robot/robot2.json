@@ -26,5 +26,4 @@
         "lock_last_strain": false,
         "time_nodes_on_measurements": false,
         "use_1D_estimator": false
-    }
 }

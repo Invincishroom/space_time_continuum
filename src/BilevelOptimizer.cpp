@@ -53,7 +53,7 @@ namespace // anonymous
         Eigen::VectorXd e_f;
         Eigen::MatrixXd info_f;
         Eigen::MatrixXd E_f;
-        Eigen::VectorXd lambda_f;
+        Eigen::VectorXd adjoint_lambda_f;
         Eigen::VectorXd e_nodes;
         double info_scale = 0.0;
     };
@@ -99,7 +99,7 @@ namespace // anonymous
         (void)trial_data_root;
 
         ObservedMask18 mask = ObservedMask18::Zero();
-        // Observe the full 18-dimensional theta state for validation so the
+        // Observe the full 18-dimensional variance state for validation so the
         // ground-truth comparison covers every dimension.
         mask.setOnes();
         return mask;
@@ -474,9 +474,25 @@ namespace // anonymous
         {
             config.enable_gradient_fd_check = root["enable_gradient_fd_check"].asBool();
         }
+        if (root.isMember("enable_unary_factor_fd_check"))
+        {
+            config.enable_unary_factor_fd_check = root["enable_unary_factor_fd_check"].asBool();
+        }
+        if (root.isMember("enable_time_factor_fd_check"))
+        {
+            config.enable_time_factor_fd_check = root["enable_time_factor_fd_check"].asBool();
+        }
+        if (root.isMember("enable_space_factor_fd_check"))
+        {
+            config.enable_space_factor_fd_check = root["enable_space_factor_fd_check"].asBool();
+        }
         if (root.isMember("gradient_fd_epsilon"))
         {
             config.gradient_fd_epsilon = root["gradient_fd_epsilon"].asDouble();
+        }
+        if (root.isMember("gradient_fd_use_lambda_perturbation"))
+        {
+            config.gradient_fd_use_lambda_perturbation = root["gradient_fd_use_lambda_perturbation"].asBool();
         }
         if (root.isMember("freeze_p0_non_pose"))
         {
@@ -486,9 +502,13 @@ namespace // anonymous
         {
             config.max_gradient_update_norm = root["max_gradient_update_norm"].asDouble();
         }
-        if (root.isMember("max_phi_step_norm"))
+        if (root.isMember("max_psi_step_norm"))
         {
-            config.max_phi_step_norm = root["max_phi_step_norm"].asDouble();
+            config.max_psi_step_norm = root["max_psi_step_norm"].asDouble();
+        }
+        else if (root.isMember("max_phi_step_norm"))
+        {
+            config.max_psi_step_norm = root["max_phi_step_norm"].asDouble();
         }
         if (root.isMember("min_theta"))
         {
@@ -602,32 +622,82 @@ namespace // anonymous
     }
 
     template <typename MatrixType>
-    void fillDiagonalFromTheta(MatrixType &matrix, const Eigen::VectorXd &theta, int offset, const char *name)
+    void fillDiagonalFromVariance(MatrixType &matrix, const Eigen::VectorXd &variance, int offset, const char *name)
     {
         const int diagonal_size = static_cast<int>(matrix.rows());
         if (matrix.rows() != matrix.cols())
         {
             throw std::runtime_error(std::string("Expected diagonal square matrix for ") + name + ".");
         }
-        if (theta.size() != kThetaSize)
+        if (variance.size() != kThetaSize)
         {
-            throw std::runtime_error("Theta must contain exactly 36 diagonal parameters for P0, Q1, Q2, and Q3.");
+            throw std::runtime_error("Variance must contain exactly 36 diagonal parameters for P0, Q1, Q2, and Q3.");
         }
-        if (offset + diagonal_size > theta.size())
+        if (offset + diagonal_size > variance.size())
         {
-            throw std::runtime_error(std::string("Theta layout is inconsistent while assembling ") + name + ".");
+            throw std::runtime_error(std::string("Variance layout is inconsistent while assembling ") + name + ".");
         }
 
         matrix.setIdentity();
         for (int i = 0; i < diagonal_size; ++i)
         {
-            const double value = theta(offset + i);
+            const double value = variance(offset + i);
             if (!(value > 0.0))
             {
                 throw std::runtime_error(std::string(name) + " must be strictly positive on the diagonal.");
             }
             matrix(i, i) = value;
         }
+    }
+
+    Spacetime::Hyperparameters buildHyperparametersFromVariance(const Eigen::VectorXd &variance)
+    {
+        Spacetime::Hyperparameters hyperparameters;
+        fillDiagonalFromVariance(hyperparameters.P0, variance, kP0Offset, "P0");
+        fillDiagonalFromVariance(hyperparameters.Q1, variance, kQ1Offset, "Q1");
+        fillDiagonalFromVariance(hyperparameters.Q2, variance, kQ2Offset, "Q2");
+        fillDiagonalFromVariance(hyperparameters.Q3, variance, kQ3Offset, "Q3");
+        return hyperparameters;
+    }
+
+    Eigen::Matrix<double, 18, 1> averageMarginalVarianceFromSample(const Spacetime::SystemState<DTYPE> &sample)
+    {
+        Eigen::Matrix<double, 18, 1> average_variance = Eigen::Matrix<double, 18, 1>::Zero();
+        if (sample.estimation_nodes.empty())
+        {
+            return average_variance;
+        }
+
+        for (const auto &node : sample.estimation_nodes)
+        {
+            if (!node.covarianceAvailable())
+            {
+                throw std::runtime_error("Time-prior sampling expected node covariances to be available.");
+            }
+
+            average_variance += node.getCovariance().diagonal().template cast<double>();
+        }
+
+        average_variance /= static_cast<double>(sample.estimation_nodes.size());
+        return average_variance;
+    }
+
+    Eigen::Matrix<double, 18, 1> averageMarginalVarianceFromSamples(
+        const std::vector<Spacetime::SystemState<DTYPE>> &samples)
+    {
+        Eigen::Matrix<double, 18, 1> average_variance = Eigen::Matrix<double, 18, 1>::Zero();
+        if (samples.empty())
+        {
+            return average_variance;
+        }
+
+        for (const auto &sample : samples)
+        {
+            average_variance += averageMarginalVarianceFromSample(sample);
+        }
+
+        average_variance /= static_cast<double>(samples.size());
+        return average_variance;
     }
 
     Eigen::VectorXd solvePositiveDefiniteSystem(const Eigen::MatrixXd& matrix, const Eigen::VectorXd& rhs)
@@ -662,7 +732,7 @@ namespace // anonymous
         return solver.solve(rhs);
     }
 
-    //u_f = Q_f^{-1} e_f lambda_f;
+    //u_f = Q_f^{-1} e_f adjoint_lambda_f;
     //v_f = Q_f^{-1} e_f;
     //w_f = Q_f^{-1} E_f e_nodes;
     Eigen::VectorXd applyFactorInformation(const Eigen::MatrixXd& info_f, const Eigen::VectorXd& rhs)
@@ -684,12 +754,12 @@ namespace // anonymous
     spacetime::FactorGradientContrib computeDiagonalFactorGradient(const Eigen::VectorXd& e_f,
                                                                     const Eigen::MatrixXd& info_f,
                                                                     const Eigen::MatrixXd& E_f,
-                                                                    const Eigen::VectorXd& lambda_f,
+                                                                    const Eigen::VectorXd& adjoint_lambda_f,
                                                                     const Eigen::VectorXd& e_nodes,
                                                                     double info_scale)
     {
         const Eigen::VectorXd v = applyFactorInformation(info_f, e_f);
-        const Eigen::VectorXd u = applyFactorInformation(info_f, E_f * lambda_f);
+        const Eigen::VectorXd u = applyFactorInformation(info_f, E_f * adjoint_lambda_f);
         const Eigen::VectorXd w = applyFactorInformation(info_f, E_f * e_nodes);
 
         spacetime::FactorGradientContrib contrib;
@@ -702,7 +772,7 @@ namespace // anonymous
                                                                       const Eigen::VectorXd& e_f,
                                                                       const Eigen::MatrixXd& info_f,
                                                                       const Eigen::MatrixXd& E_f,
-                                                                      const Eigen::VectorXd& lambda_f,
+                                                                      const Eigen::VectorXd& adjoint_lambda_f,
                                                                       const Eigen::VectorXd& e_nodes,
                                                                       double info_scale)
     {
@@ -712,7 +782,7 @@ namespace // anonymous
         }
 
         const Eigen::VectorXd v = applyFactorInformation(info_f, e_f);
-        const Eigen::VectorXd u = applyFactorInformation(info_f, E_f * lambda_f);
+        const Eigen::VectorXd u = applyFactorInformation(info_f, E_f * adjoint_lambda_f);
         const Eigen::VectorXd w = applyFactorInformation(info_f, E_f * e_nodes);
 
         if (v.size() != 18 || u.size() != 18 || w.size() != 18)
@@ -757,7 +827,7 @@ namespace // anonymous
                                                                        const Eigen::VectorXd& e_f,
                                                                        const Eigen::MatrixXd& info_f,
                                                                        const Eigen::MatrixXd& E_f,
-                                                                       const Eigen::VectorXd& lambda_f,
+                                                                       const Eigen::VectorXd& adjoint_lambda_f,
                                                                        const Eigen::VectorXd& e_nodes,
                                                                        double info_scale)
     {
@@ -767,7 +837,7 @@ namespace // anonymous
         }
 
         const Eigen::VectorXd v = applyFactorInformation(info_f, e_f);
-        const Eigen::VectorXd u = applyFactorInformation(info_f, E_f * lambda_f);
+        const Eigen::VectorXd u = applyFactorInformation(info_f, E_f * adjoint_lambda_f);
         const Eigen::VectorXd w = applyFactorInformation(info_f, E_f * e_nodes);
 
         if (v.size() != 18 || u.size() != 18 || w.size() != 18)
@@ -874,26 +944,26 @@ namespace // anonymous
                                                                     const Eigen::VectorXd& e_f,
                                                                     const Eigen::MatrixXd& Q_f,
                                                                     const Eigen::MatrixXd& E_f,
-                                                                    const Eigen::VectorXd& lambda_f,
+                                                                    const Eigen::VectorXd& adjoint_lambda_f,
                                                                     const Eigen::VectorXd& e_nodes,
                                                                     double info_scale)
     {
         // If this is Time factor
         if (dynamic_cast<const Spacetime::Factors::BinaryTimeFactor*>(&factor) != nullptr)
         {
-            return computeBinaryTimeFactorGradient(local_nodes, e_f, Q_f, E_f, lambda_f, e_nodes, info_scale);
+            return computeBinaryTimeFactorGradient(local_nodes, e_f, Q_f, E_f, adjoint_lambda_f, e_nodes, info_scale);
         }
 
         // If this is Space factor
         if (dynamic_cast<const Spacetime::Factors::BinarySpaceFactor*>(&factor) != nullptr)
         {
-            return computeBinarySpaceFactorGradient(local_nodes, e_f, Q_f, E_f, lambda_f, e_nodes, info_scale);
+            return computeBinarySpaceFactorGradient(local_nodes, e_f, Q_f, E_f, adjoint_lambda_f, e_nodes, info_scale);
         }
 
         // If this is unary factor
         if (dynamic_cast<const Spacetime::Factors::UnaryFactor*>(&factor) != nullptr)
         {
-            return computeDiagonalFactorGradient(e_f, Q_f, E_f, lambda_f, e_nodes, info_scale);
+            return computeDiagonalFactorGradient(e_f, Q_f, E_f, adjoint_lambda_f, e_nodes, info_scale);
         }
 
         throw std::runtime_error("Unknown factor type.");
@@ -1198,6 +1268,36 @@ namespace // anonymous
         return gradient;
     }
 
+    Eigen::VectorXd finiteDifferenceGradientViaLambda(const Eigen::VectorXd& theta0,
+                                                      double epsilon,
+                                                      const std::function<double(const Eigen::VectorXd&)>& objective)
+    {
+        if ((theta0.array() <= 0.0).any())
+        {
+            throw std::runtime_error("finiteDifferenceGradientViaLambda expects strictly positive theta values.");
+        }
+
+        const Eigen::VectorXd lambda0 = theta0.cwiseInverse();
+        Eigen::VectorXd dL_dlambda = Eigen::VectorXd::Zero(theta0.size());
+
+        for (int i = 0; i < lambda0.size(); ++i)
+        {
+            const double step = epsilon * std::max(1.0, std::abs(lambda0(i)));
+            Eigen::VectorXd lambda_plus = lambda0;
+            Eigen::VectorXd lambda_minus = lambda0;
+            lambda_plus(i) += step;
+            lambda_minus(i) = std::max(1e-12, lambda_minus(i) - step);
+
+            const Eigen::VectorXd theta_plus = lambda_plus.cwiseInverse();
+            const Eigen::VectorXd theta_minus = lambda_minus.cwiseInverse();
+            dL_dlambda(i) = (objective(theta_plus) - objective(theta_minus)) / (lambda_plus(i) - lambda_minus(i));
+        }
+
+        // Convert dL/dlambda to dL/dtheta using lambda = 1/theta:
+        // dL/dtheta = dL/dlambda * d(1/theta)/dtheta = -dL/dlambda * lambda^2.
+        return (-dL_dlambda.array() * lambda0.array().square()).matrix();
+    }
+
     void printGradientCheckSummary(const std::string& name,
                                    const Eigen::VectorXd& analytic,
                                    const Eigen::VectorXd& numeric)
@@ -1227,11 +1327,10 @@ namespace // anonymous
                   << ", worst_index=" << worst_index << std::endl;
     }
 
-    void runKernelFiniteDifferenceChecks(const Eigen::VectorXd& theta,
-                                         const FactorKernelSample& unary_sample,
-                                         const FactorKernelSample& time_sample,
-                                         const FactorKernelSample& space_sample,
-                                         double epsilon)
+    void runUnaryFactorFiniteDifferenceCheck(const Eigen::VectorXd& variance,
+                                             const FactorKernelSample& unary_sample,
+                                             double epsilon,
+                                             bool perturb_lambda)
     {
         if (unary_sample.available)
         {
@@ -1239,80 +1338,102 @@ namespace // anonymous
                 unary_sample.e_f,
                 unary_sample.info_f,
                 unary_sample.E_f,
-                unary_sample.lambda_f,
+                unary_sample.adjoint_lambda_f,
                 unary_sample.e_nodes,
                 unary_sample.info_scale);
             const Eigen::VectorXd analytic = contrib.dL_dtheta_state + contrib.dL_dtheta_info;
 
-            const Eigen::VectorXd theta_unary = theta.segment<18>(kP0Offset);
-            const Eigen::VectorXd a = unary_sample.E_f * unary_sample.lambda_f;
+            const Eigen::VectorXd variance_unary = variance.segment<18>(kP0Offset);
+            const Eigen::VectorXd a = unary_sample.E_f * unary_sample.adjoint_lambda_f;
             const Eigen::VectorXd b = unary_sample.e_f;
             const Eigen::VectorXd c = unary_sample.E_f * unary_sample.e_nodes;
 
-            const auto objective = [&](const Eigen::VectorXd& theta_local) {
-                Eigen::MatrixXd info = theta_local.cwiseInverse().asDiagonal();
+            const auto objective = [&](const Eigen::VectorXd& variance_local) {
+                Eigen::MatrixXd info = variance_local.cwiseInverse().asDiagonal();
                 return (a.transpose() * info * b)(0, 0) - unary_sample.info_scale * (c.transpose() * info * c)(0, 0);
             };
 
-            const Eigen::VectorXd numeric = finiteDifferenceGradient(theta_unary, epsilon, objective);
+            const Eigen::VectorXd numeric = perturb_lambda
+                ? finiteDifferenceGradientViaLambda(variance_unary, epsilon, objective)
+                : finiteDifferenceGradient(variance_unary, epsilon, objective);
             printGradientCheckSummary("unary", analytic, numeric);
         }
+    }
 
-        if (time_sample.available)
+    void runVarianceFiniteDifferenceChecks(const Eigen::VectorXd& variance,
+                                         const FactorKernelSample& unary_sample,
+                                         const FactorKernelSample& time_sample,
+                                         const FactorKernelSample& space_sample,
+                                         double epsilon,
+                                         bool perturb_lambda,
+                                         bool run_unary,
+                                         bool run_time,
+                                         bool run_space)
+    {
+        if (run_unary)
+        {
+            runUnaryFactorFiniteDifferenceCheck(variance, unary_sample, epsilon, perturb_lambda);
+        }
+
+        if (run_time && time_sample.available)
         {
             const spacetime::FactorGradientContrib contrib = computeBinaryTimeFactorGradient(
                 time_sample.local_nodes,
                 time_sample.e_f,
                 time_sample.info_f,
                 time_sample.E_f,
-                time_sample.lambda_f,
+                time_sample.adjoint_lambda_f,
                 time_sample.e_nodes,
                 time_sample.info_scale);
             const Eigen::VectorXd analytic = contrib.dL_dtheta_state + contrib.dL_dtheta_info;
 
-            Eigen::VectorXd theta_time(12);
-            theta_time.segment<6>(0) = theta.segment<6>(kQ1Offset);
-            theta_time.segment<6>(6) = theta.segment<6>(kQ3Offset);
-            const Eigen::VectorXd a = time_sample.E_f * time_sample.lambda_f;
+            Eigen::VectorXd variance_time(12);
+            variance_time.segment<6>(0) = variance.segment<6>(kQ1Offset);
+            variance_time.segment<6>(6) = variance.segment<6>(kQ3Offset);
+            const Eigen::VectorXd a = time_sample.E_f * time_sample.adjoint_lambda_f;
             const Eigen::VectorXd b = time_sample.e_f;
             const Eigen::VectorXd c = time_sample.E_f * time_sample.e_nodes;
 
-            const auto objective = [&](const Eigen::VectorXd& theta_local) {
-                const Matrix18d Q = buildTimeCovariance(time_sample.local_nodes, theta_local);
+            const auto objective = [&](const Eigen::VectorXd& variance_local) {
+                const Matrix18d Q = buildTimeCovariance(time_sample.local_nodes, variance_local);
                 const Matrix18d info = Q.inverse();
                 return -(a.transpose() * info * b)(0, 0) - time_sample.info_scale * (c.transpose() * info * c)(0, 0);
             };
 
-            const Eigen::VectorXd numeric = finiteDifferenceGradient(theta_time, epsilon, objective);
+            const Eigen::VectorXd numeric = perturb_lambda
+                ? finiteDifferenceGradientViaLambda(variance_time, epsilon, objective)
+                : finiteDifferenceGradient(variance_time, epsilon, objective);
             printGradientCheckSummary("time", analytic, numeric);
         }
 
-        if (space_sample.available)
+        if (run_space && space_sample.available)
         {
             const spacetime::FactorGradientContrib contrib = computeBinarySpaceFactorGradient(
                 space_sample.local_nodes,
                 space_sample.e_f,
                 space_sample.info_f,
                 space_sample.E_f,
-                space_sample.lambda_f,
+                space_sample.adjoint_lambda_f,
                 space_sample.e_nodes,
                 space_sample.info_scale);
             const Eigen::VectorXd analytic = contrib.dL_dtheta_state + contrib.dL_dtheta_info;
 
-            Eigen::VectorXd theta_space(12);
-            theta_space.segment<6>(0) = theta.segment<6>(kQ2Offset);
-            theta_space.segment<6>(6) = theta.segment<6>(kQ3Offset);
-            const Eigen::VectorXd a = space_sample.E_f * space_sample.lambda_f;
+            Eigen::VectorXd variance_space(12);
+            variance_space.segment<6>(0) = variance.segment<6>(kQ2Offset);
+            variance_space.segment<6>(6) = variance.segment<6>(kQ3Offset);
+            const Eigen::VectorXd a = space_sample.E_f * space_sample.adjoint_lambda_f;
             const Eigen::VectorXd b = space_sample.e_f;
             const Eigen::VectorXd c = space_sample.E_f * space_sample.e_nodes;
 
-            const auto objective = [&](const Eigen::VectorXd& theta_local) {
-                const Matrix18d Q = buildSpaceCovariance(space_sample.local_nodes, theta_local);
+            const auto objective = [&](const Eigen::VectorXd& variance_local) {
+                const Matrix18d Q = buildSpaceCovariance(space_sample.local_nodes, variance_local);
                 const Matrix18d info = Q.inverse();
                 return -(a.transpose() * info * b)(0, 0) - space_sample.info_scale * (c.transpose() * info * c)(0, 0);
             };
 
-            const Eigen::VectorXd numeric = finiteDifferenceGradient(theta_space, epsilon, objective);
+            const Eigen::VectorXd numeric = perturb_lambda
+                ? finiteDifferenceGradientViaLambda(variance_space, epsilon, objective)
+                : finiteDifferenceGradient(variance_space, epsilon, objective);
             printGradientCheckSummary("space", analytic, numeric);
         }
     }
@@ -1367,6 +1488,10 @@ namespace // anonymous
         const Json::Value trial_config = loadJsonFile(trial_config_path);
         const Json::Value robot_config = loadJsonFile(robot_config_path);
         const Json::Value estimator_config = loadJsonFile(estimator_config_path);
+
+        // Initialize estimator options before any branch that may construct an
+        // Estimator (e.g., prior-only ground-truth sampling).
+        loadEstimatorOptionsFromJson(estimator_config, data.estimator_options);
 
         data.initial_theta = loadInitialThetaFromRobotConfig(robot_config);
 
@@ -1429,81 +1554,138 @@ namespace // anonymous
                 throw std::runtime_error("validation_sample_count must be positive in prior_only_ground_truth_mode.");
             }
 
-            Eigen::VectorXd gt_cov_diag = Eigen::VectorXd::Zero(18); //"Ground Truth" Covariance
-            if (options_root.isMember("ground_truth_covariance_diagonal"))
-            {
-                const Json::Value gt_cov = options_root["ground_truth_covariance_diagonal"];
-                if (!gt_cov.isArray() || gt_cov.size() != 18)
-                {
-                    throw std::runtime_error("ground_truth_covariance_diagonal must be an array of size 18.");
-                }
-                for (int i = 0; i < 18; ++i)
-                {
-                    gt_cov_diag(i) = gt_cov[i].asDouble();
-                }
-            }
-            else
-            {
-                const Json::Value p0 = robot_config["weights"]["P0"];
-                if (!p0.isArray() || p0.size() != 18)
-                {
-                    throw std::runtime_error("Robot config weights.P0 must be an array of size 18.");
-                }
-                for (int i = 0; i < 18; ++i)
-                {
-                    gt_cov_diag(i) = p0[i].asDouble();
-                }
-            }
+            // Build a single unary+time pair trajectory. Multiple independent
+            // GT examples are generated by drawing many prior samples over this pair.
+            data.nodes.clear();
+            data.robot_topology.N = 1;
+            data.robot_topology.K = 2;
+            data.robot_topology.t0 = trial_start_time;
+            const double dt_pair = (trial_end_time > trial_start_time)
+                ? (trial_end_time - trial_start_time)
+                : 1.0;
+            data.robot_topology.T = dt_pair;
 
-            for (int i = 0; i < gt_cov_diag.size(); ++i)
-            {
-                if (!(gt_cov_diag(i) > 0.0))
-                {
-                    throw std::runtime_error("Ground-truth covariance diagonal entries must be strictly positive.");
-                }
-            }
-            for (size_t i = 0; i < gt_cov_diag.size(); ++i)
-            {
-                std::cout << "GT covariance diag[" << i << "] = " << gt_cov_diag[i] << std::endl;
-            }
-            //sleep for 1 second
-            sleep(2);
-            std::mt19937 rng(validation_rng_seed);
-            std::normal_distribution<double> standard_normal(0.0, 1.0);
-            Eigen::Matrix<double, 18, 1> perturbation_sum = Eigen::Matrix<double, 18, 1>::Zero();
-            Eigen::Matrix<double, 18, 1> perturbation_sq_sum = Eigen::Matrix<double, 18, 1>::Zero();
-
-            for (int sample_idx = 0; sample_idx < validation_sample_count; ++sample_idx)
+            for (int k = 0; k < static_cast<int>(data.robot_topology.K); ++k)
             {
                 spacetime::OptimizationProblem::Node node;
                 node.pose = Eigen::Matrix<double, 4, 4>::Identity();
                 node.epsilon = Eigen::Matrix<double, 6, 1>::Zero();
                 node.varpi = Eigen::Matrix<double, 6, 1>::Zero();
                 node.arclength = 0.0;
-                node.time = trial_start_time + static_cast<double>(sample_idx);
+                node.time = trial_start_time + (k == 0 ? 0.0 : dt_pair);
                 data.nodes.push_back(node);
-
-                Eigen::Matrix<double, 18, 1> perturb = Eigen::Matrix<double, 18, 1>::Zero();
-                for (int i = 0; i < 18; ++i)
-                {
-                    perturb(i) = std::sqrt(gt_cov_diag(i)) * standard_normal(rng);
-                }
-                perturbation_sum += perturb;
-                perturbation_sq_sum += perturb.array().square().matrix();
-
-                spacetime::ValidationTarget target;
-                target.node_index = sample_idx;
-                target.ground_truth = node;
-                target.ground_truth.pose = se3::vec2tran(perturb.segment<6>(0)) * target.ground_truth.pose;
-                target.ground_truth.epsilon += perturb.segment<6>(6);
-                target.ground_truth.varpi += perturb.segment<6>(12);
-                target.observed_mask = validation_observed_mask;
-                data.validation_targets.push_back(target);
             }
 
-            const double sample_count = static_cast<double>(validation_sample_count);
-            const Eigen::Matrix<double, 18, 1> perturbation_mean = perturbation_sum / sample_count;
-            data.validation_variance = (perturbation_sq_sum / sample_count - perturbation_mean.array().square().matrix()).cwiseMax(0.0);
+            if (!data.robot_topology.use_1D_estimator && data.nodes.size() > 1)
+            {
+                Spacetime::Options sampling_options = data.estimator_options;
+                sampling_options.compute_covariances = true;
+
+                Spacetime::Estimator sampler(
+                    data.robot_topology,
+                    buildHyperparametersFromVariance(data.initial_theta),
+                    sampling_options);
+                sampler.setRandomSeed(validation_rng_seed);
+
+                Spacetime::SystemState<DTYPE> mean_state;
+                mean_state.estimation_nodes = data.nodes;
+                mean_state.ib = false;
+
+                const std::vector<Spacetime::SystemState<DTYPE>> samples =
+                    sampler.samplePrior(mean_state, data.robot_topology, validation_sample_count);
+                if (samples.empty())
+                {
+                    throw std::runtime_error("Time-prior sampling did not return any samples.");
+                }
+
+                for (const auto &sampled_state : samples)
+                {
+                    if (sampled_state.estimation_nodes.size() != data.nodes.size())
+                    {
+                        throw std::runtime_error("Time-prior sampling returned an unexpected number of nodes.");
+                    }
+
+                    for (std::size_t node_index = 0; node_index < sampled_state.estimation_nodes.size(); ++node_index)
+                    {
+                        spacetime::ValidationTarget target;
+                        target.node_index = static_cast<int>(node_index);
+                        target.ground_truth = sampled_state.estimation_nodes[node_index];
+                        target.observed_mask = validation_observed_mask;
+                        data.validation_targets.push_back(target);
+                    }
+                }
+
+                data.validation_variance = averageMarginalVarianceFromSamples(samples);
+            }
+            else
+            {
+                Eigen::VectorXd gt_cov_diag = Eigen::VectorXd::Zero(18); // "Ground Truth" covariance
+                if (options_root.isMember("ground_truth_covariance_diagonal"))
+                {
+                    const Json::Value gt_cov = options_root["ground_truth_covariance_diagonal"];
+                    if (!gt_cov.isArray() || gt_cov.size() != 18)
+                    {
+                        throw std::runtime_error("ground_truth_covariance_diagonal must be an array of size 18.");
+                    }
+                    for (int i = 0; i < 18; ++i)
+                    {
+                        gt_cov_diag(i) = gt_cov[i].asDouble();
+                    }
+                }
+                else
+                {
+                    const Json::Value p0 = robot_config["weights"]["P0"];
+                    if (!p0.isArray() || p0.size() != 18)
+                    {
+                        throw std::runtime_error("Robot config weights.P0 must be an array of size 18.");
+                    }
+                    for (int i = 0; i < 18; ++i)
+                    {
+                        gt_cov_diag(i) = p0[i].asDouble();
+                    }
+                }
+
+                for (int i = 0; i < gt_cov_diag.size(); ++i)
+                {
+                    if (!(gt_cov_diag(i) > 0.0))
+                    {
+                        throw std::runtime_error("Ground-truth covariance diagonal entries must be strictly positive.");
+                    }
+                }
+                for (size_t i = 0; i < gt_cov_diag.size(); ++i)
+                {
+                    std::cout << "GT covariance diag[" << i << "] = " << gt_cov_diag[i] << std::endl;
+                }
+                sleep(2);
+                std::mt19937 rng(validation_rng_seed);
+                std::normal_distribution<double> standard_normal(0.0, 1.0);
+                Eigen::Matrix<double, 18, 1> perturbation_sum = Eigen::Matrix<double, 18, 1>::Zero();
+                Eigen::Matrix<double, 18, 1> perturbation_sq_sum = Eigen::Matrix<double, 18, 1>::Zero();
+
+                for (int sample_idx = 0; sample_idx < validation_sample_count; ++sample_idx)
+                {
+                    Eigen::Matrix<double, 18, 1> perturb = Eigen::Matrix<double, 18, 1>::Zero();
+                    for (int i = 0; i < 18; ++i)
+                    {
+                        perturb(i) = std::sqrt(gt_cov_diag(i)) * standard_normal(rng);
+                    }
+                    perturbation_sum += perturb;
+                    perturbation_sq_sum += perturb.array().square().matrix();
+
+                    spacetime::ValidationTarget target;
+                    target.node_index = sample_idx;
+                    target.ground_truth = data.nodes[static_cast<std::size_t>(sample_idx)];
+                    target.ground_truth.pose = se3::vec2tran(perturb.segment<6>(0)) * target.ground_truth.pose;
+                    target.ground_truth.epsilon += perturb.segment<6>(6);
+                    target.ground_truth.varpi += perturb.segment<6>(12);
+                    target.observed_mask = validation_observed_mask;
+                    data.validation_targets.push_back(target);
+                }
+
+                const double sample_count = static_cast<double>(validation_sample_count);
+                const Eigen::Matrix<double, 18, 1> perturbation_mean = perturbation_sum / sample_count;
+                data.validation_variance = (perturbation_sq_sum / sample_count - perturbation_mean.array().square().matrix()).cwiseMax(0.0);
+            }
         }
         else
         {
@@ -1608,7 +1790,6 @@ namespace // anonymous
             data.validation_targets.push_back(target);
         }
 
-        loadEstimatorOptionsFromJson(estimator_config, data.estimator_options);
         return data;
     }
 }
@@ -1704,10 +1885,10 @@ namespace spacetime {
     void OptimizationProblem::assembleFromTheta()
     {
         hyperparameters_ = Spacetime::Hyperparameters();
-        fillDiagonalFromTheta(hyperparameters_.P0, theta_, kP0Offset, "P0");
-        fillDiagonalFromTheta(hyperparameters_.Q1, theta_, kQ1Offset, "Q1");
-        fillDiagonalFromTheta(hyperparameters_.Q2, theta_, kQ2Offset, "Q2");
-        fillDiagonalFromTheta(hyperparameters_.Q3, theta_, kQ3Offset, "Q3");
+        fillDiagonalFromVariance(hyperparameters_.P0, theta_, kP0Offset, "P0");
+        fillDiagonalFromVariance(hyperparameters_.Q1, theta_, kQ1Offset, "Q1");
+        fillDiagonalFromVariance(hyperparameters_.Q2, theta_, kQ2Offset, "Q2");
+        fillDiagonalFromVariance(hyperparameters_.Q3, theta_, kQ3Offset, "Q3");
     }
 
     LowerLevelSolution OptimizationProblem::solveLowerLevel(bool verbose) // Returns x*, H and linearisation data.
@@ -2110,7 +2291,7 @@ namespace spacetime {
         return step(Eigen::VectorXd());
     }
 
-    Optimizer::Result Optimizer::step(const Eigen::VectorXd& phi) //Main loop
+    Optimizer::Result Optimizer::step(const Eigen::VectorXd& psi) //Main loop
     {
         Result result;
         if (!problem_)
@@ -2124,23 +2305,24 @@ namespace spacetime {
             throw std::runtime_error("Optimizer::step requires validation targets for NLL-based outer optimization.");
         }
 
-        Eigen::VectorXd current_phi;
-        if (phi.size() == 0)
+        Eigen::VectorXd current_psi;
+        if (psi.size() == 0)
         {
             const Eigen::VectorXd &initial_theta = problem_->theta();
             if (initial_theta.size() != kThetaSize)
             {
                 throw std::runtime_error("Optimizer::step could not infer an initial 36-vector theta from the problem.");
             }
-            current_phi = optimizer_config.use_exponential_param ? initial_theta.array().log().matrix() : initial_theta;
+            const Eigen::VectorXd initial_lambda = initial_theta.cwiseInverse();
+            current_psi = optimizer_config.use_exponential_param ? initial_lambda.array().log().matrix() : initial_lambda;
         }
         else
         {
-            current_phi = phi;
+            current_psi = psi;
         }
 
-        //theta = exp(phi) if use_exponential_param is true, otherwise theta = phi
-        auto mapTheta = [&](const Eigen::VectorXd &unconstrained) -> Eigen::VectorXd {
+        //lambda = exp(psi) if use_exponential_param is true, otherwise lambda = psi
+        auto mapLambda = [&](const Eigen::VectorXd &unconstrained) -> Eigen::VectorXd {
             if (optimizer_config.use_exponential_param)
             {
                 return unconstrained.array().exp().matrix();
@@ -2148,12 +2330,14 @@ namespace spacetime {
             return unconstrained;
         };
 
-        double previous_loss = std::numeric_limits<double>::infinity();
-        const int validation_count = static_cast<int>(validation_targets.size());
-        // L = 0.5 * (logdet + mahalanobis), so quadratic info-term gradients must carry 0.5 scale.
+        auto mapVariance = [&](const Eigen::VectorXd &lambda) -> Eigen::VectorXd {
+            return lambda.cwiseInverse();
+        };
+
+        // L = 0.5 * (logdet(P) + e^T * P^{-1} * e)
         constexpr double kNllQuadraticScale = -0.5;
-        Eigen::VectorXd adam_m = Eigen::VectorXd::Zero(current_phi.size());
-        Eigen::VectorXd adam_v = Eigen::VectorXd::Zero(current_phi.size());
+        Eigen::VectorXd adam_m = Eigen::VectorXd::Zero(current_psi.size());
+        Eigen::VectorXd adam_v = Eigen::VectorXd::Zero(current_psi.size());
         double beta1_power = 1.0;
         double beta2_power = 1.0;
         const std::filesystem::path outer_loop_log_path = resolveAssetsLogPath("bilevel_optimizer_outer_loop_" + formatTimestamp() + ".log");
@@ -2166,20 +2350,19 @@ namespace spacetime {
         outer_loop_log << "iteration";
         for (int i = 0; i < kThetaSize; ++i)
         {
-            outer_loop_log << ",theta[" << i << "]";
+            outer_loop_log << ",lambda[" << i << "]";
         }
         for (int i = 0; i < kThetaSize; ++i)
         {
-            outer_loop_log << ",dL_dtheta[" << i << "]";
+            outer_loop_log << ",dL_dlambda[" << i << "]";
         }
         outer_loop_log << ",mean_mahalanobis,mean_logdet,validation_nll\n";
-
-        Eigen::VectorXd previous_theta = mapTheta(current_phi);
 
         //Main optimization loop
         for (int iter = 0; iter < optimizer_config.max_iterations; ++iter)
         {
-            const Eigen::VectorXd theta = mapTheta(current_phi);
+            const Eigen::VectorXd lambda = mapLambda(current_psi);
+            const Eigen::VectorXd theta = mapVariance(lambda);
             problem_->setTheta(theta);
 
             const LowerLevelSolution solution = problem_->solveLowerLevel(optimizer_config.verbose);
@@ -2203,7 +2386,8 @@ namespace spacetime {
 
             result.loss = validation.loss;
             result.iterations = iter + 1;
-            result.phi = current_phi;
+            result.psi = current_psi;
+            result.lambda = lambda;
             result.theta = theta;
 
             Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> adjoint_solver;
@@ -2213,7 +2397,7 @@ namespace spacetime {
                 throw std::runtime_error("Optimizer::step failed to factorize the lower-level information matrix.");
             }
 
-            const Eigen::VectorXd lambda = adjoint_solver.solve(adjoint_rhs);
+            const Eigen::VectorXd adjoint_lambda = adjoint_solver.solve(adjoint_rhs);
             if (adjoint_solver.info() != Eigen::Success)
             {
                 throw std::runtime_error("Optimizer::step failed to solve the adjoint system.");
@@ -2296,9 +2480,9 @@ namespace spacetime {
                     }
                 }
             }
-            const Eigen::VectorXd lambda_masked = lambda.array() * global_observed_mask.array();
+            const Eigen::VectorXd adjoint_lambda_masked = adjoint_lambda.array() * global_observed_mask.array();
 
-            Eigen::VectorXd dL_dtheta = Eigen::VectorXd::Zero(kThetaSize);
+            Eigen::VectorXd gradient_dL_dtheta = Eigen::VectorXd::Zero(kThetaSize);
             FactorKernelSample unary_sample;
             FactorKernelSample time_sample;
             FactorKernelSample space_sample;
@@ -2314,7 +2498,7 @@ namespace spacetime {
 
                 std::vector<Spacetime::SystemState<DTYPE>::Node> local_nodes;
                 local_nodes.reserve(lin.node_indices.size());
-                Eigen::VectorXd lambda_f = Eigen::VectorXd::Zero(static_cast<int>(lin.node_indices.size()) * 18);
+                Eigen::VectorXd adjoint_lambda_f = Eigen::VectorXd::Zero(static_cast<int>(lin.node_indices.size()) * 18);
                 Eigen::VectorXd e_nodes = Eigen::VectorXd::Zero(static_cast<int>(lin.node_indices.size()) * 18);
                 Eigen::VectorXd local_observed_mask = Eigen::VectorXd::Zero(static_cast<int>(lin.node_indices.size()) * 18);
                 const int local_dim = static_cast<int>(lin.node_indices.size()) * 18;
@@ -2329,7 +2513,7 @@ namespace spacetime {
                     }
 
                     local_nodes.push_back(solved_nodes[static_cast<std::size_t>(node_index)]);
-                    lambda_f.segment<18>(static_cast<int>(j) * 18) = lambda_masked.segment<18>(node_index * 18);
+                    adjoint_lambda_f.segment<18>(static_cast<int>(j) * 18) = adjoint_lambda_masked.segment<18>(node_index * 18);
                     e_nodes.segment<18>(static_cast<int>(j) * 18) = global_validation_errors.segment<18>(node_index * 18);
                     local_observed_mask.segment<18>(static_cast<int>(j) * 18) = global_observed_mask.segment<18>(node_index * 18);
                 }
@@ -2369,14 +2553,14 @@ namespace spacetime {
                         unary_sample.e_f = lin.e;
                         unary_sample.info_f = lin.Q;
                         unary_sample.E_f = lin.E;
-                        unary_sample.lambda_f = lambda_f;
+                        unary_sample.adjoint_lambda_f = adjoint_lambda_f;
                         unary_sample.e_nodes = e_nodes;
                         unary_sample.info_scale = kNllQuadraticScale;
                     }
-                    const FactorGradientContrib contrib = computeDiagonalFactorGradient(lin.e, lin.Q, lin.E, lambda_f, e_nodes, kNllQuadraticScale);
+                    const FactorGradientContrib contrib = computeDiagonalFactorGradient(lin.e, lin.Q, lin.E, adjoint_lambda_f, e_nodes, kNllQuadraticScale);
                     std::cout << "Node index: " << lin.node_indices[0] << ", contrib.dL_dtheta_state: " << contrib.dL_dtheta_state.transpose() << ", contrib.dL_dtheta_info: " << contrib.dL_dtheta_info.transpose() << std::endl;
-                    dL_dtheta.segment<18>(0) += contrib.dL_dtheta_state + contrib.dL_dtheta_info;
-                    dL_dtheta.segment<18>(0) += computeUnaryLogDetGradientFromTrace(A_logdet);
+                    gradient_dL_dtheta.segment<18>(0) += contrib.dL_dtheta_state + contrib.dL_dtheta_info;
+                    gradient_dL_dtheta.segment<18>(0) += computeUnaryLogDetGradientFromTrace(A_logdet);
                     continue;
                 }
 
@@ -2400,16 +2584,16 @@ namespace spacetime {
                         space_sample.e_f = lin.e;
                         space_sample.info_f = lin.Q;
                         space_sample.E_f = lin.E;
-                        space_sample.lambda_f = lambda_f;
+                        space_sample.adjoint_lambda_f = adjoint_lambda_f;
                         space_sample.e_nodes = e_nodes;
                         space_sample.info_scale = kNllQuadraticScale;
                     }
-                    const FactorGradientContrib contrib = computeBinarySpaceFactorGradient(local_nodes, lin.e, lin.Q, lin.E, lambda_f, e_nodes, kNllQuadraticScale);
-                    dL_dtheta.segment<6>(24) += contrib.dL_dtheta_state.segment<6>(0) + contrib.dL_dtheta_info.segment<6>(0); // Q2
-                    dL_dtheta.segment<6>(30) += contrib.dL_dtheta_state.segment<6>(6) + contrib.dL_dtheta_info.segment<6>(6); // Q3
+                    const FactorGradientContrib contrib = computeBinarySpaceFactorGradient(local_nodes, lin.e, lin.Q, lin.E, adjoint_lambda_f, e_nodes, kNllQuadraticScale);
+                    gradient_dL_dtheta.segment<6>(24) += contrib.dL_dtheta_state.segment<6>(0) + contrib.dL_dtheta_info.segment<6>(0); // Q2
+                    gradient_dL_dtheta.segment<6>(30) += contrib.dL_dtheta_state.segment<6>(6) + contrib.dL_dtheta_info.segment<6>(6); // Q3
                     const Eigen::VectorXd logdet_contrib = computeBinarySpaceLogDetGradientFromTrace(local_nodes, A_logdet);
-                    dL_dtheta.segment<6>(24) += logdet_contrib.segment<6>(0);
-                    dL_dtheta.segment<6>(30) += logdet_contrib.segment<6>(6);
+                    gradient_dL_dtheta.segment<6>(24) += logdet_contrib.segment<6>(0);
+                    gradient_dL_dtheta.segment<6>(30) += logdet_contrib.segment<6>(6);
                     continue;
                 }
 
@@ -2422,17 +2606,17 @@ namespace spacetime {
                         time_sample.e_f = lin.e;
                         time_sample.info_f = lin.Q;
                         time_sample.E_f = lin.E;
-                        time_sample.lambda_f = lambda_f;
+                        time_sample.adjoint_lambda_f = adjoint_lambda_f;
                         time_sample.e_nodes = e_nodes;
                         time_sample.info_scale = kNllQuadraticScale;
                     }
 
-                    const FactorGradientContrib contrib = computeBinaryTimeFactorGradient(local_nodes, lin.e, lin.Q, lin.E, lambda_f, e_nodes, kNllQuadraticScale);
-                    dL_dtheta.segment<6>(18) += contrib.dL_dtheta_state.segment<6>(0) + contrib.dL_dtheta_info.segment<6>(0); // Q1
-                    dL_dtheta.segment<6>(30) += contrib.dL_dtheta_state.segment<6>(6) + contrib.dL_dtheta_info.segment<6>(6); // Q3
+                    const FactorGradientContrib contrib = computeBinaryTimeFactorGradient(local_nodes, lin.e, lin.Q, lin.E, adjoint_lambda_f, e_nodes, kNllQuadraticScale);
+                    gradient_dL_dtheta.segment<6>(18) += contrib.dL_dtheta_state.segment<6>(0) + contrib.dL_dtheta_info.segment<6>(0); // Q1
+                    gradient_dL_dtheta.segment<6>(30) += contrib.dL_dtheta_state.segment<6>(6) + contrib.dL_dtheta_info.segment<6>(6); // Q3
                     const Eigen::VectorXd logdet_contrib = computeBinaryTimeLogDetGradientFromTrace(local_nodes, A_logdet);
-                    dL_dtheta.segment<6>(18) += logdet_contrib.segment<6>(0);
-                    dL_dtheta.segment<6>(30) += logdet_contrib.segment<6>(6);
+                    gradient_dL_dtheta.segment<6>(18) += logdet_contrib.segment<6>(0);
+                    gradient_dL_dtheta.segment<6>(30) += logdet_contrib.segment<6>(6);
                     continue;
                 }
 
@@ -2441,24 +2625,29 @@ namespace spacetime {
 
             if (optimizer_config.enable_gradient_fd_check)
             {
-                runKernelFiniteDifferenceChecks(
+                runVarianceFiniteDifferenceChecks(
                     theta,
                     unary_sample,
                     time_sample,
                     space_sample,
-                    optimizer_config.gradient_fd_epsilon);
+                    optimizer_config.gradient_fd_epsilon,
+                    optimizer_config.gradient_fd_use_lambda_perturbation,
+                    optimizer_config.enable_unary_factor_fd_check,
+                    optimizer_config.enable_time_factor_fd_check,
+                    optimizer_config.enable_space_factor_fd_check);
             }
-            const Eigen::VectorXd raw_dL_dtheta = dL_dtheta;
-            Eigen::VectorXd dL_dtheta_update = raw_dL_dtheta*theta.array().matrix(); // Chain rule for phi = log(theta) if using exponential parameterization
-            Eigen::VectorXd theta_sqrt = theta.array().sqrt().matrix();
+            const Eigen::VectorXd variance_gradient = gradient_dL_dtheta;
+            Eigen::VectorXd dL_dlambda = -variance_gradient.array() / lambda.array().square();
+            Eigen::VectorXd dL_dpsi = optimizer_config.use_exponential_param
+                ? (dL_dlambda.array() * lambda.array()).matrix()
+                : dL_dlambda;
             if (optimizer_config.freeze_p0_non_pose)
             {
-                dL_dtheta_update.segment<12>(6).setZero();
+                dL_dlambda.segment<12>(6).setZero();
+                dL_dpsi.segment<12>(6).setZero();
             }
 
-            Eigen::VectorXd dL_dphi = dL_dtheta_update*theta_sqrt.array().matrix();
-
-            const double grad_norm = raw_dL_dtheta.norm();
+            const double grad_norm = dL_dlambda.norm();
             if (optimizer_config.verbose)
             {
                 std::cout << "Outer iteration " << iter
@@ -2466,34 +2655,34 @@ namespace spacetime {
                           << ", mean_mahalanobis=" << validation.mean_nees
                           << ", mean_logdet=" << validation.mean_logdet
                           << ", grad_norm=" << grad_norm
+                          << ", lambda_min=" << lambda.minCoeff()
+                          << ", lambda_max=" << lambda.maxCoeff()
                           << ", theta_min=" << theta.minCoeff()
                           << ", theta_max=" << theta.maxCoeff()
                           << std::endl;
             }
 
             outer_loop_log << iter;
-            for (int i = 0; i < theta.size(); ++i)
+            for (int i = 0; i < lambda.size(); ++i)
             {
-                outer_loop_log << ',' << theta[i];
+                outer_loop_log << ',' << lambda[i];
             }
-            for (int i = 0; i < raw_dL_dtheta.size(); ++i)
+            for (int i = 0; i < dL_dlambda.size(); ++i)
             {
-                outer_loop_log << ',' << raw_dL_dtheta[i];
+                outer_loop_log << ',' << dL_dlambda[i];
             }
             outer_loop_log << ',' << validation.mean_nees << ',' << validation.mean_logdet << ',' << validation.loss << '\n';
-            previous_theta = theta;
-
             if (grad_norm < optimizer_config.tol_grad)
             {
                 result.converged = true;
                 break;
             }
 
-            Eigen::VectorXd update_direction = dL_dphi;
+            Eigen::VectorXd update_direction = dL_dpsi;
             if (optimizer_config.use_adam)
             {
-                adam_m = optimizer_config.adam_beta1 * adam_m + (1.0 - optimizer_config.adam_beta1) * dL_dphi;
-                adam_v = optimizer_config.adam_beta2 * adam_v + (1.0 - optimizer_config.adam_beta2) * dL_dphi.array().square().matrix();
+                adam_m = optimizer_config.adam_beta1 * adam_m + (1.0 - optimizer_config.adam_beta1) * dL_dpsi;
+                adam_v = optimizer_config.adam_beta2 * adam_v + (1.0 - optimizer_config.adam_beta2) * dL_dpsi.array().square().matrix();
                 beta1_power *= optimizer_config.adam_beta1;
                 beta2_power *= optimizer_config.adam_beta2;
 
@@ -2517,40 +2706,46 @@ namespace spacetime {
                 }
             }
 
-            Eigen::VectorXd delta_phi = -optimizer_config.learning_rate * update_direction;
-            const double delta_phi_norm = delta_phi.norm();
-            if (std::isfinite(delta_phi_norm) && optimizer_config.max_phi_step_norm > 0.0 &&
-                delta_phi_norm > optimizer_config.max_phi_step_norm)
+            Eigen::VectorXd delta_psi = -optimizer_config.learning_rate * update_direction;
+            const double delta_psi_norm = delta_psi.norm();
+            if (std::isfinite(delta_psi_norm) && optimizer_config.max_psi_step_norm > 0.0 &&
+                delta_psi_norm > optimizer_config.max_psi_step_norm)
             {
-                const double scale = optimizer_config.max_phi_step_norm / delta_phi_norm;
-                delta_phi *= scale;
+                const double scale = optimizer_config.max_psi_step_norm / delta_psi_norm;
+                delta_psi *= scale;
                 if (optimizer_config.verbose)
                 {
-                    std::cout << "Clipped phi step norm from " << delta_phi_norm
-                              << " to " << optimizer_config.max_phi_step_norm << std::endl;
+                    std::cout << "Clipped psi step norm from " << delta_psi_norm
+                              << " to " << optimizer_config.max_psi_step_norm << std::endl;
                 }
             }
 
-            current_phi += delta_phi;
+            current_psi += delta_psi;
 
             if (optimizer_config.use_exponential_param)
             {
-                const double min_theta = std::max(optimizer_config.min_theta, 1e-12);
-                const double max_theta = std::max(optimizer_config.max_theta, min_theta);
-                const double min_phi = std::log(min_theta);
-                const double max_phi = std::log(max_theta);
-                current_phi = current_phi.array().max(min_phi).min(max_phi).matrix();
+                const double min_lambda = std::max(1.0 / std::max(optimizer_config.max_theta, optimizer_config.min_theta), 1e-12);
+                const double max_lambda = std::max(1.0 / std::max(optimizer_config.min_theta, 1e-12), min_lambda);
+                const double min_psi = std::log(min_lambda);
+                const double max_psi = std::log(max_lambda);
+                current_psi = current_psi.array().max(min_psi).min(max_psi).matrix();
             }
-            previous_loss = validation.loss;
         }
 
-        result.phi = current_phi;
-        result.theta = mapTheta(current_phi);
+        result.psi = current_psi;
+        result.lambda = mapLambda(current_psi);
+        result.theta = mapVariance(result.lambda);
         problem_->setTheta(result.theta);
 
         const auto &summary = problem_->runSummary();
+        Eigen::VectorXd validation_precision = summary.validation_variance;
+        for (int i = 0; i < validation_precision.size(); ++i)
+        {
+            const double v = summary.validation_variance(i);
+            validation_precision(i) = (v > 0.0) ? (1.0 / v) : 0.0;
+        }
         outer_loop_log << "\nrun_summary\n";
-        outer_loop_log << "N,K,tol_grad,tol_loss,learning_rate,R_pose,R_gyro,validation_sample_count,validation_variance,converged\n";
+        outer_loop_log << "N,K,tol_grad,tol_loss,learning_rate,R_pose,R_gyro,validation_sample_count,validation_precision,converged\n";
         outer_loop_log << problem_->robotTopology().N << ','
                        << problem_->robotTopology().K << ','
                        << optimizer_config.tol_grad << ','
@@ -2559,7 +2754,7 @@ namespace spacetime {
                        << '"' << formatVector(summary.R_pose) << '"' << ','
                        << '"' << formatVector(summary.R_gyro) << '"' << ','
                        << summary.validation_sample_count << ','
-                       << '"' << formatVector(summary.validation_variance) << '"' << ','
+                       << '"' << formatVector(validation_precision) << '"' << ','
                        << (result.converged ? "true" : "false") << '\n';
         return result;
     }
@@ -2648,7 +2843,7 @@ int main(int argc, char** argv)
     std::cout << "Converged: " << (result.converged ? "true" : "false") << std::endl;
     std::cout << "Iterations: " << result.iterations << std::endl;
     std::cout << "Final loss: " << result.loss << std::endl;
-    std::cout << "Theta min/max: " << result.theta.minCoeff() << " / " << result.theta.maxCoeff() << std::endl;
+    std::cout << "Lambda min/max: " << result.lambda.minCoeff() << " / " << result.lambda.maxCoeff() << std::endl;
 
     return 0;
 }

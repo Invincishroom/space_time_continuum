@@ -6,7 +6,7 @@ import re
 
 
 MAX_PLOT_ITERATIONS = 10000
-THETA_DIMS_TO_PLOT = 18
+PARAM_DIMS_TO_PLOT = 18
 
 
 def _to_float(value):
@@ -136,7 +136,7 @@ def _parse_numeric_vector(raw_value):
 	return values
 
 
-def _load_gt_from_log_run_summary(log_path):
+def _load_gt_from_log_run_summary(log_path, parameter_name):
 	try:
 		raw_lines = log_path.read_text().splitlines()
 		if "run_summary" not in raw_lines:
@@ -151,26 +151,59 @@ def _load_gt_from_log_run_summary(log_path):
 		values = next(summary_reader, [])
 		run_summary = {key: value for key, value in zip(fields, values)}
 
+		if parameter_name == "lambda":
+			validation_precision_raw = run_summary.get("validation_precision")
+			if validation_precision_raw is not None:
+				validation_precision = _parse_numeric_vector(validation_precision_raw)
+				if len(validation_precision) >= PARAM_DIMS_TO_PLOT:
+					gt_lambda = validation_precision[:PARAM_DIMS_TO_PLOT]
+					if all(value > 0.0 for value in gt_lambda):
+						return gt_lambda, f"{log_path.name}:run_summary.validation_precision"
+
+			validation_variance_raw = run_summary.get("validation_variance")
+			if validation_variance_raw is None:
+				return None, None
+
+			validation_variance = _parse_numeric_vector(validation_variance_raw)
+			if len(validation_variance) < PARAM_DIMS_TO_PLOT:
+				return None, None
+
+			gt_lambda = []
+			for value in validation_variance[:PARAM_DIMS_TO_PLOT]:
+				if value <= 0.0:
+					return None, None
+				gt_lambda.append(1.0 / value)
+			return gt_lambda, f"{log_path.name}:run_summary.validation_variance^-1"
+
 		validation_variance_raw = run_summary.get("validation_variance")
-		if validation_variance_raw is None:
+		if validation_variance_raw is not None:
+			validation_variance = _parse_numeric_vector(validation_variance_raw)
+			if len(validation_variance) >= PARAM_DIMS_TO_PLOT:
+				gt_theta = validation_variance[:PARAM_DIMS_TO_PLOT]
+				if all(value > 0.0 for value in gt_theta):
+					return gt_theta, f"{log_path.name}:run_summary.validation_variance"
+
+		validation_precision_raw = run_summary.get("validation_precision")
+		if validation_precision_raw is None:
 			return None, None
 
-		validation_variance = _parse_numeric_vector(validation_variance_raw)
-		if len(validation_variance) < THETA_DIMS_TO_PLOT:
+		validation_precision = _parse_numeric_vector(validation_precision_raw)
+		if len(validation_precision) < PARAM_DIMS_TO_PLOT:
 			return None, None
 
-		gt_theta = validation_variance[:THETA_DIMS_TO_PLOT]
-		if any(value <= 0.0 for value in gt_theta):
-			return None, None
-
-		return gt_theta, f"{log_path.name}:run_summary.validation_variance"
+		gt_theta = []
+		for value in validation_precision[:PARAM_DIMS_TO_PLOT]:
+			if value <= 0.0:
+				return None, None
+			gt_theta.append(1.0 / value)
+		return gt_theta, f"{log_path.name}:run_summary.validation_precision^-1"
 	except Exception:
 		return None, None
 
 
-def _load_ground_truth_theta(log_path, repo_root):
+def _load_ground_truth_parameter(log_path, repo_root, parameter_name):
 	# Prefer values embedded in the selected log's run summary when available.
-	gt_from_log, log_source = _load_gt_from_log_run_summary(log_path)
+	gt_from_log, log_source = _load_gt_from_log_run_summary(log_path, parameter_name)
 	if gt_from_log is not None:
 		return gt_from_log, log_source
 
@@ -192,17 +225,17 @@ def _load_ground_truth_theta(log_path, repo_root):
 
 		weights = config.get("weights", {})
 		p0 = weights.get("P0")
-		if not isinstance(p0, list) or len(p0) < THETA_DIMS_TO_PLOT:
+		if not isinstance(p0, list) or len(p0) < PARAM_DIMS_TO_PLOT:
 			continue
 
 		gt = []
-		for i in range(THETA_DIMS_TO_PLOT):
+		for i in range(PARAM_DIMS_TO_PLOT):
 			val = _to_float(p0[i])
-			if val is None:
+			if val is None or val <= 0.0:
 				break
-			gt.append(val)
+			gt.append(1.0 / val if parameter_name == "lambda" else val)
 
-		if len(gt) == THETA_DIMS_TO_PLOT:
+		if len(gt) == PARAM_DIMS_TO_PLOT:
 			return gt, config_path
 
 	return None, None
@@ -271,20 +304,36 @@ def select_log_file():
 	return prompt_log_selection(summaries)
 
 
-def _sorted_gradient_keys(row):
+def _detect_parameter_name(fieldnames):
+	if any(name.startswith("lambda[") and name.endswith("]") for name in fieldnames):
+		return "lambda"
+	if any(name.startswith("theta[") and name.endswith("]") for name in fieldnames):
+		return "theta"
+	return "theta"
+
+
+def _sorted_gradient_keys(row, parameter_name):
+	prefixes = [f"dL_d{parameter_name}["]
+	if parameter_name != "theta":
+		prefixes.append("dL_dtheta[")
+	if parameter_name != "lambda":
+		prefixes.append("dL_dlambda[")
+
 	keys = []
 	for key in row.keys():
-		if key.startswith("dL_dtheta[") and key.endswith("]"):
-			idx = _to_int(key[len("dL_dtheta[") : -1])
-			if idx is not None:
-				keys.append((idx, key))
+		for prefix in prefixes:
+			if key.startswith(prefix) and key.endswith("]"):
+				idx = _to_int(key[len(prefix) : -1])
+				if idx is not None:
+					keys.append((idx, key))
+				break
 	keys.sort(key=lambda item: item[0])
 	return [key for _, key in keys]
 
 
 def load_plot_data(log_path):
 	iterations = []
-	theta_series = [[] for _ in range(THETA_DIMS_TO_PLOT)]
+	parameter_series = [[] for _ in range(PARAM_DIMS_TO_PLOT)]
 	gradient_norms = []
 	consistency_values = []
 	objective_values = []
@@ -294,6 +343,7 @@ def load_plot_data(log_path):
 	with log_path.open("r", newline="") as f:
 		reader = csv.DictReader(f)
 		fieldnames = reader.fieldnames or []
+		parameter_name = _detect_parameter_name(fieldnames)
 		if "nees" in fieldnames:
 			consistency_name = "nees"
 		elif "mean_mahalanobis" in fieldnames:
@@ -316,17 +366,17 @@ def load_plot_data(log_path):
 			if iteration >= MAX_PLOT_ITERATIONS:
 				continue
 
-			theta_values = []
-			for i in range(THETA_DIMS_TO_PLOT):
-				theta_val = _to_float(row.get(f"theta[{i}]"))
-				if theta_val is None:
+			parameter_values = []
+			for i in range(PARAM_DIMS_TO_PLOT):
+				parameter_value = _to_float(row.get(f"{parameter_name}[{i}]"))
+				if parameter_value is None:
 					break
-				theta_values.append(theta_val)
-			if len(theta_values) != THETA_DIMS_TO_PLOT:
+				parameter_values.append(parameter_value)
+			if len(parameter_values) != PARAM_DIMS_TO_PLOT:
 				continue
 
 			if gradient_keys is None:
-				gradient_keys = _sorted_gradient_keys(row)
+				gradient_keys = _sorted_gradient_keys(row, parameter_name)
 
 			grad_components = []
 			for key in gradient_keys:
@@ -340,8 +390,8 @@ def load_plot_data(log_path):
 			grad_norm = math.sqrt(sum(component * component for component in grad_components))
 
 			iterations.append(iteration)
-			for i in range(THETA_DIMS_TO_PLOT):
-				theta_series[i].append(theta_values[i])
+			for i in range(PARAM_DIMS_TO_PLOT):
+				parameter_series[i].append(parameter_values[i])
 			gradient_norms.append(grad_norm)
 			consistency_values.append(consistency)
 			objective_values.append(objective)
@@ -351,7 +401,8 @@ def load_plot_data(log_path):
 
 	return {
 		"iterations": iterations,
-		"theta_series": theta_series,
+		"parameter_series": parameter_series,
+		"parameter_name": parameter_name,
 		"gradient_norms": gradient_norms,
 		"consistency_values": consistency_values,
 		"objective_values": objective_values,
@@ -370,9 +421,10 @@ def plot_selected_log(log_path):
 
 	plot_data = load_plot_data(log_path)
 	repo_root = Path(__file__).resolve().parents[1]
-	gt_theta, gt_theta_source = _load_ground_truth_theta(log_path, repo_root)
+	parameter_name = plot_data["parameter_name"]
+	gt_parameter, gt_parameter_source = _load_ground_truth_parameter(log_path, repo_root, parameter_name)
 	iterations = plot_data["iterations"]
-	theta_series = plot_data["theta_series"]
+	parameter_series = plot_data["parameter_series"]
 	gradient_norms = plot_data["gradient_norms"]
 	consistency_values = plot_data["consistency_values"]
 	objective_values = plot_data["objective_values"]
@@ -383,10 +435,10 @@ def plot_selected_log(log_path):
 	fig.suptitle(f"Optimization Trace: {log_path.name}", fontsize=13)
 
 	ax_theta = axes[0][0]
-	for i in range(THETA_DIMS_TO_PLOT):
-		theta_line, = ax_theta.plot(iterations, _log10_or_nan(theta_series[i]), label=f"theta[{i}]")
-		if gt_theta is not None:
-			gt_value = gt_theta[i]
+	for i in range(PARAM_DIMS_TO_PLOT):
+		parameter_line, = ax_theta.plot(iterations, _log10_or_nan(parameter_series[i]), label=f"{parameter_name}[{i}]")
+		if gt_parameter is not None:
+			gt_value = gt_parameter[i]
 			if gt_value is not None and gt_value > 0.0:
 				ax_theta.plot(
 					iterations,
@@ -394,18 +446,18 @@ def plot_selected_log(log_path):
 					linestyle="--",
 					linewidth=1.0,
 					alpha=0.7,
-					color=theta_line.get_color(),
-					label=f"gt_theta[{i}]",
+					color=parameter_line.get_color(),
+					label=f"gt_{parameter_name}[{i}]",
 				)
-	ax_theta.set_title("log10(theta[0-17]) vs iteration")
-	ax_theta.set_ylabel("log10(theta)")
+	ax_theta.set_title(f"log10({parameter_name}[0-17]) vs iteration")
+	ax_theta.set_ylabel(f"log10({parameter_name})")
 	ax_theta.grid(True, alpha=0.3)
 	ax_theta.legend(loc="best", fontsize=6, ncol=3)
 
 	ax_grad = axes[0][1]
 	ax_grad.plot(iterations, _log10_or_nan(gradient_norms), color="tab:orange")
 	ax_grad.set_title("log10(gradient norm) vs iteration")
-	ax_grad.set_ylabel("log10(||dL/dtheta||)")
+	ax_grad.set_ylabel(f"log10(||dL/d{parameter_name}||)")
 	ax_grad.grid(True, alpha=0.3)
 
 	ax_nees = axes[1][0]

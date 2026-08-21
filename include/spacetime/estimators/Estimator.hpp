@@ -139,6 +139,8 @@ namespace Spacetime
         void setOptions(Options options);
         Options getOptions() { return m_options; }
 
+        void setRandomSeed(unsigned int seed) { m_rng.seed(seed); }
+
         // Get system state expressed with T_ib frames
         SystemState<DTYPE> getSystemState() { return m_state; }
 
