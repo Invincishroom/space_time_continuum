@@ -26,6 +26,7 @@ struct LowerLevelSolution {
 
 struct ValidationTarget {
     int node_index = -1;
+    int sample_group_id = 0;
     Spacetime::SystemState<DTYPE>::Node ground_truth;
     Eigen::Matrix<int, 18, 1> observed_mask = Eigen::Matrix<int, 18, 1>::Ones();
 };

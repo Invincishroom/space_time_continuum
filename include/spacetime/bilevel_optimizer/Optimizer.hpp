@@ -35,6 +35,8 @@ public:
         double gradient_fd_epsilon = 1e-6; // central-difference epsilon for gradient checks
         bool gradient_fd_use_lambda_perturbation = true; // if true, perturb lambda and chain-rule back to theta for FD checks
         bool freeze_p0_non_pose = false; // if true, freeze lambda[6..17] so only pose-related P0 terms are updated
+        bool use_joint_validation_objective = false; // if true, use full joint validation covariance objective; otherwise use marginal objective
+        bool log_joint_diagnostics = true; // if true, log pathway norms/conditioning diagnostics per iteration
         double max_gradient_update_norm = 1e4; // clip update direction norm before applying optimizer step
         double max_psi_step_norm = 0.5; // clip per-iteration psi update norm
         double min_theta = 1e-8; // lower clamp for theta after inversion

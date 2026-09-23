@@ -20,7 +20,7 @@
         "lidar": false,
         "fbgs": false,
         "start_time": 0,
-        "end_time": 20
+        "end_time": 3
     },
     "options": {
         "estimator": "batch",
@@ -29,7 +29,7 @@
         "extract_from_front": false,
         "validation_interval": 1,
         "prior_only_ground_truth_mode": true,
-        "validation_sample_count": 20,
+        "validation_sample_count": 300,
         "validation_rng_seed": 7 // Original seed is 7
     }
 }

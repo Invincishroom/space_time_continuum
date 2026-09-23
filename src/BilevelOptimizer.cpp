@@ -46,6 +46,32 @@ namespace // anonymous
         double marginal_solve_ms = 0.0;
     };
 
+    struct JointValidationCacheData
+    {
+        std::vector<int> node_indices;
+        std::vector<Eigen::Matrix<int, 18, 1>> observed_masks;
+        Eigen::VectorXd node_errors_stacked;
+        Eigen::MatrixXd h_inv_selector;
+        Eigen::MatrixXd joint_covariance;
+        Eigen::MatrixXd joint_information;
+        Eigen::VectorXd weighted_errors;
+        int effective_validation_count = 0;
+        int observed_dim_total = 0;
+        double logdet_sum = 0.0;
+        double mahalanobis_sum = 0.0;
+        double min_observed_cov_eig = 0.0;
+        double max_observed_cov_eig = 0.0;
+        double observed_cov_condition = 0.0;
+    };
+
+    struct JointGroupLogDetData
+    {
+        std::vector<int> node_indices;
+        Eigen::MatrixXd joint_information;
+        Eigen::MatrixXd logdet_projection;
+        Eigen::VectorXd quadratic_state;
+    };
+
     struct FactorKernelSample
     {
         bool available = false;
@@ -118,7 +144,50 @@ namespace // anonymous
         return masked;
     }
 
+    std::vector<std::vector<spacetime::ValidationTarget>> groupValidationTargetsBySample(
+        const std::vector<spacetime::ValidationTarget>& validation_targets)
+    {
+        std::vector<std::vector<spacetime::ValidationTarget>> groups;
+        if (validation_targets.empty())
+        {
+            return groups;
+        }
+
+        std::unordered_map<int, std::size_t> group_index_by_id;
+        group_index_by_id.reserve(validation_targets.size());
+        for (const auto& target : validation_targets)
+        {
+            const int group_id = target.sample_group_id;
+            auto it = group_index_by_id.find(group_id);
+            if (it == group_index_by_id.end())
+            {
+                const std::size_t new_index = groups.size();
+                group_index_by_id.emplace(group_id, new_index);
+                groups.push_back({target});
+            }
+            else
+            {
+                groups[it->second].push_back(target);
+            }
+        }
+
+        return groups;
+    }
+
     Eigen::MatrixXd extractPrincipalSubmatrix(const Matrix18d &matrix, const std::vector<int> &indices)
+    {
+        Eigen::MatrixXd out(indices.size(), indices.size());
+        for (int r = 0; r < static_cast<int>(indices.size()); ++r)
+        {
+            for (int c = 0; c < static_cast<int>(indices.size()); ++c)
+            {
+                out(r, c) = matrix(indices[static_cast<std::size_t>(r)], indices[static_cast<std::size_t>(c)]);
+            }
+        }
+        return out;
+    }
+
+    Eigen::MatrixXd extractPrincipalSubmatrixDynamic(const Eigen::MatrixXd &matrix, const std::vector<int> &indices)
     {
         Eigen::MatrixXd out(indices.size(), indices.size());
         for (int r = 0; r < static_cast<int>(indices.size()); ++r)
@@ -498,6 +567,14 @@ namespace // anonymous
         {
             config.freeze_p0_non_pose = root["freeze_p0_non_pose"].asBool();
         }
+        if (root.isMember("use_joint_validation_objective"))
+        {
+            config.use_joint_validation_objective = root["use_joint_validation_objective"].asBool();
+        }
+        if (root.isMember("log_joint_diagnostics"))
+        {
+            config.log_joint_diagnostics = root["log_joint_diagnostics"].asBool();
+        }
         if (root.isMember("max_gradient_update_norm"))
         {
             config.max_gradient_update_norm = root["max_gradient_update_norm"].asDouble();
@@ -660,44 +737,45 @@ namespace // anonymous
         return hyperparameters;
     }
 
-    Eigen::Matrix<double, 18, 1> averageMarginalVarianceFromSample(const Spacetime::SystemState<DTYPE> &sample)
-    {
-        Eigen::Matrix<double, 18, 1> average_variance = Eigen::Matrix<double, 18, 1>::Zero();
-        if (sample.estimation_nodes.empty())
-        {
-            return average_variance;
-        }
-
-        for (const auto &node : sample.estimation_nodes)
-        {
-            if (!node.covarianceAvailable())
-            {
-                throw std::runtime_error("Time-prior sampling expected node covariances to be available.");
-            }
-
-            average_variance += node.getCovariance().diagonal().template cast<double>();
-        }
-
-        average_variance /= static_cast<double>(sample.estimation_nodes.size());
-        return average_variance;
-    }
-
-    Eigen::Matrix<double, 18, 1> averageMarginalVarianceFromSamples(
+    Eigen::Matrix<double, 18, 1> empiricalValidationVarianceFromSamples(
+        const std::vector<Spacetime::SystemState<DTYPE>::Node> &mean_nodes,
         const std::vector<Spacetime::SystemState<DTYPE>> &samples)
     {
-        Eigen::Matrix<double, 18, 1> average_variance = Eigen::Matrix<double, 18, 1>::Zero();
-        if (samples.empty())
+        Eigen::Matrix<double, 18, 1> sum = Eigen::Matrix<double, 18, 1>::Zero();
+        Eigen::Matrix<double, 18, 1> sum_sq = Eigen::Matrix<double, 18, 1>::Zero();
+        std::size_t count = 0;
+
+        if (samples.empty() || mean_nodes.empty())
         {
-            return average_variance;
+            return Eigen::Matrix<double, 18, 1>::Zero();
         }
 
         for (const auto &sample : samples)
         {
-            average_variance += averageMarginalVarianceFromSample(sample);
+            if (sample.estimation_nodes.size() != mean_nodes.size())
+            {
+                throw std::runtime_error("Sample node count mismatch while computing empirical validation variance.");
+            }
+
+            for (std::size_t node_index = 0; node_index < mean_nodes.size(); ++node_index)
+            {
+                const Eigen::Matrix<double, 18, 1> e = computeNodeValidationError(
+                    mean_nodes[node_index],
+                    sample.estimation_nodes[node_index]);
+                sum += e;
+                sum_sq += e.array().square().matrix();
+                ++count;
+            }
         }
 
-        average_variance /= static_cast<double>(samples.size());
-        return average_variance;
+        if (count == 0)
+        {
+            return Eigen::Matrix<double, 18, 1>::Zero();
+        }
+
+        const double denom = static_cast<double>(count);
+        const Eigen::Matrix<double, 18, 1> mean = sum / denom;
+        return (sum_sq / denom - mean.array().square().matrix()).cwiseMax(0.0);
     }
 
     Eigen::VectorXd solvePositiveDefiniteSystem(const Eigen::MatrixXd& matrix, const Eigen::VectorXd& rhs)
@@ -734,7 +812,7 @@ namespace // anonymous
 
     //u_f = Q_f^{-1} e_f adjoint_lambda_f;
     //v_f = Q_f^{-1} e_f;
-    //w_f = Q_f^{-1} E_f e_nodes;
+    //w_f = Q_f^{-1} E_f r_{quad,f};
     Eigen::VectorXd applyFactorInformation(const Eigen::MatrixXd& info_f, const Eigen::VectorXd& rhs)
     {
         if (info_f.cols() != rhs.size())
@@ -1083,6 +1161,215 @@ namespace // anonymous
         return -eigenvalues.log().sum();
     }
 
+    JointValidationCacheData buildJointValidationCache(
+        const Eigen::SparseMatrix<double>& H,
+        const std::vector<spacetime::ValidationTarget>& validation_targets,
+        const std::vector<Spacetime::SystemState<DTYPE>::Node>& solved_nodes,
+        const Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>>& h_solver)
+    {
+        JointValidationCacheData cache;
+        if (validation_targets.empty() || solved_nodes.empty())
+        {
+            return cache;
+        }
+
+        constexpr int node_dim = 18;
+        const int validation_count = static_cast<int>(validation_targets.size());
+        const int joint_dim = validation_count * node_dim;
+        cache.node_indices.reserve(validation_targets.size());
+        cache.observed_masks.reserve(validation_targets.size());
+        cache.node_errors_stacked = Eigen::VectorXd::Zero(joint_dim);
+
+        Eigen::MatrixXd rhs_selector = Eigen::MatrixXd::Zero(H.rows(), joint_dim);
+        for (int i = 0; i < validation_count; ++i)
+        {
+            const auto& target = validation_targets[static_cast<size_t>(i)];
+            if (target.node_index < 0 || target.node_index >= static_cast<int>(solved_nodes.size()))
+            {
+                throw std::runtime_error("buildJointValidationCache: validation node index out of range.");
+            }
+
+            cache.node_indices.push_back(target.node_index);
+            cache.observed_masks.push_back(target.observed_mask);
+
+            const auto& estimate = solved_nodes[static_cast<size_t>(target.node_index)];
+            const Vector18d e_full = computeNodeValidationError(estimate, target.ground_truth);
+            const Vector18d e_masked = applyObservedMask(e_full, target.observed_mask);
+            cache.node_errors_stacked.segment<18>(i * node_dim) = e_masked;
+
+            const int observed_dims = countObservedDimensions(target.observed_mask);
+            if (observed_dims > 0)
+            {
+                ++cache.effective_validation_count;
+                cache.observed_dim_total += observed_dims;
+            }
+
+            rhs_selector.block(target.node_index * node_dim, i * node_dim, node_dim, node_dim).setIdentity();
+        }
+
+        cache.h_inv_selector = h_solver.solve(rhs_selector);
+        if (h_solver.info() != Eigen::Success)
+        {
+            throw std::runtime_error("buildJointValidationCache: failed to solve for H^{-1}E_V projection.");
+        }
+
+        cache.joint_covariance = Eigen::MatrixXd::Zero(joint_dim, joint_dim);
+        for (int i = 0; i < validation_count; ++i)
+        {
+            const int node_index_i = cache.node_indices[static_cast<size_t>(i)];
+            for (int j = 0; j < validation_count; ++j)
+            {
+                cache.joint_covariance.block(i * node_dim, j * node_dim, node_dim, node_dim) =
+                    cache.h_inv_selector.block(node_index_i * node_dim, j * node_dim, node_dim, node_dim);
+            }
+        }
+        cache.joint_covariance = 0.5 * (cache.joint_covariance + cache.joint_covariance.transpose());
+
+        std::vector<int> observed_indices;
+        observed_indices.reserve(joint_dim);
+        for (int i = 0; i < validation_count; ++i)
+        {
+            const auto& mask = cache.observed_masks[static_cast<size_t>(i)];
+            for (int d = 0; d < node_dim; ++d)
+            {
+                if (mask(d) != 0)
+                {
+                    observed_indices.push_back(i * node_dim + d);
+                }
+            }
+        }
+
+        cache.joint_information = Eigen::MatrixXd::Zero(joint_dim, joint_dim);
+        cache.weighted_errors = Eigen::VectorXd::Zero(joint_dim);
+        if (observed_indices.empty())
+        {
+            return cache;
+        }
+
+        constexpr double kCovFloor = 1e-20;
+        constexpr double kLogDetFloor = 1e-22;
+        Eigen::MatrixXd joint_cov_observed = extractPrincipalSubmatrixDynamic(cache.joint_covariance, observed_indices);
+        joint_cov_observed = 0.5 * (joint_cov_observed + joint_cov_observed.transpose());
+
+        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eigensolver(joint_cov_observed);
+        if (eigensolver.info() != Eigen::Success)
+        {
+            throw std::runtime_error("buildJointValidationCache: failed to eigendecompose joint observed covariance.");
+        }
+        if (eigensolver.eigenvalues().size() > 0)
+        {
+            cache.min_observed_cov_eig = eigensolver.eigenvalues().minCoeff();
+            cache.max_observed_cov_eig = eigensolver.eigenvalues().maxCoeff();
+            const double denom_cond = std::max(cache.min_observed_cov_eig, kLogDetFloor);
+            cache.observed_cov_condition = cache.max_observed_cov_eig / denom_cond;
+        }
+        const Eigen::VectorXd evals_for_logdet = eigensolver.eigenvalues().array().max(kLogDetFloor);
+        cache.logdet_sum = evals_for_logdet.array().log().sum();
+
+        Eigen::VectorXd evals_for_inv = eigensolver.eigenvalues().array().max(kCovFloor);
+        joint_cov_observed = eigensolver.eigenvectors() * evals_for_inv.asDiagonal() * eigensolver.eigenvectors().transpose();
+
+        const Eigen::MatrixXd rhs_identity = Eigen::MatrixXd::Identity(static_cast<int>(observed_indices.size()), static_cast<int>(observed_indices.size()));
+        Eigen::LLT<Eigen::MatrixXd> llt(joint_cov_observed);
+        if (llt.info() != Eigen::Success)
+        {
+            throw std::runtime_error("buildJointValidationCache: failed LLT factorization for joint observed covariance.");
+        }
+        const Eigen::MatrixXd joint_info_observed = llt.solve(rhs_identity);
+
+        for (int r = 0; r < static_cast<int>(observed_indices.size()); ++r)
+        {
+            for (int c = 0; c < static_cast<int>(observed_indices.size()); ++c)
+            {
+                cache.joint_information(observed_indices[static_cast<std::size_t>(r)], observed_indices[static_cast<std::size_t>(c)]) =
+                    joint_info_observed(r, c);
+            }
+        }
+
+        cache.weighted_errors = cache.joint_information * cache.node_errors_stacked;
+        cache.mahalanobis_sum = cache.node_errors_stacked.dot(cache.weighted_errors);
+        return cache;
+    }
+
+    spacetime::ValidationLossData computeValidationLossWithJoint(
+        const std::vector<spacetime::ValidationTarget>& validation_targets,
+        const JointValidationCacheData& cache)
+    {
+        spacetime::ValidationLossData out;
+        if (validation_targets.empty())
+        {
+            return out;
+        }
+
+        out.nees_per_node = Eigen::VectorXd::Zero(static_cast<int>(validation_targets.size()));
+        out.node_errors_stacked = cache.node_errors_stacked;
+        out.mahalanobis_sum = cache.mahalanobis_sum;
+        out.logdet_sum = cache.logdet_sum;
+        const double denom = static_cast<double>(std::max(1, cache.effective_validation_count));
+        out.mean_nees = out.mahalanobis_sum / denom;
+        out.mean_logdet = out.logdet_sum / denom;
+        const double mean_observed_dims = static_cast<double>(cache.observed_dim_total) / denom;
+        out.delta = out.mean_nees - mean_observed_dims;
+        out.loss = 0.5 * (out.logdet_sum + out.mahalanobis_sum);
+        return out;
+    }
+
+    Eigen::VectorXd computeAdjointRhsWithJoint(const Eigen::SparseMatrix<double>& H,
+                                               const std::vector<spacetime::ValidationTarget>& validation_targets,
+                                               const JointValidationCacheData& cache)
+    {
+        Eigen::VectorXd rhs = Eigen::VectorXd::Zero(H.rows());
+        if (validation_targets.empty())
+        {
+            return rhs;
+        }
+
+        constexpr int node_dim = 18;
+        for (int i = 0; i < static_cast<int>(validation_targets.size()); ++i)
+        {
+            const int node_index = cache.node_indices[static_cast<size_t>(i)];
+            if (node_index < 0 || (node_index + 1) * node_dim > rhs.size())
+            {
+                throw std::runtime_error("computeAdjointRhsWithJoint: validation node index out of range.");
+            }
+
+            const Vector18d e = cache.node_errors_stacked.segment<18>(i * node_dim);
+            if (countObservedDimensions(cache.observed_masks[static_cast<size_t>(i)]) == 0)
+            {
+                continue;
+            }
+
+            const Vector18d weighted_error = cache.weighted_errors.segment<18>(i * node_dim);
+            Matrix18d J = Matrix18d::Identity();
+            J.block<6, 6>(0, 0) = se3::vec2jacinv(e.segment<6>(0));
+            rhs.segment<18>(node_index * node_dim) += J.transpose() * weighted_error;
+        }
+        return rhs;
+    }
+
+    Eigen::VectorXd computeQuadraticRhsWithJoint(const Eigen::SparseMatrix<double>& H,
+                                                 const std::vector<spacetime::ValidationTarget>& validation_targets,
+                                                 const JointValidationCacheData& cache)
+    {
+        Eigen::VectorXd rhs = Eigen::VectorXd::Zero(H.rows());
+        if (validation_targets.empty())
+        {
+            return rhs;
+        }
+
+        constexpr int node_dim = 18;
+        for (int i = 0; i < static_cast<int>(validation_targets.size()); ++i)
+        {
+            const int node_index = cache.node_indices[static_cast<size_t>(i)];
+            if (node_index < 0 || (node_index + 1) * node_dim > rhs.size())
+            {
+                throw std::runtime_error("computeQuadraticRhsWithJoint: validation node index out of range.");
+            }
+            rhs.segment<18>(node_index * node_dim) += cache.weighted_errors.segment<18>(i * node_dim);
+        }
+        return rhs;
+    }
+
     spacetime::ValidationLossData computeValidationLossWithMarginals(
         const std::vector<spacetime::ValidationTarget>& validation_targets,
         const std::vector<Spacetime::SystemState<DTYPE>::Node>& solved_nodes,
@@ -1179,6 +1466,45 @@ namespace // anonymous
             Matrix18d J = Matrix18d::Identity();
             J.block<6, 6>(0, 0) = se3::vec2jacinv(e.segment<6>(0));
             rhs.segment<18>(target.node_index * node_dim) += J.transpose() * p_inv_observed * e;
+        }
+        return rhs;
+    }
+
+    Eigen::VectorXd computeQuadraticRhsWithMarginals(const Eigen::SparseMatrix<double>& H,
+                                                     const std::vector<spacetime::ValidationTarget>& validation_targets,
+                                                     const spacetime::ValidationLossData& validation,
+                                                     const MarginalCacheData& cache)
+    {
+        Eigen::VectorXd rhs = Eigen::VectorXd::Zero(H.rows());
+        if (validation_targets.empty())
+        {
+            return rhs;
+        }
+
+        constexpr int node_dim = 18;
+        const int validation_count = static_cast<int>(validation_targets.size());
+        if (validation.node_errors_stacked.size() != validation_count * node_dim)
+        {
+            throw std::runtime_error("computeQuadraticRhsWithMarginals: validation error vector has unexpected size.");
+        }
+
+        for (int i = 0; i < validation_count; ++i)
+        {
+            const auto& target = validation_targets[static_cast<size_t>(i)];
+            if (target.node_index < 0 || (target.node_index + 1) * node_dim > rhs.size())
+            {
+                throw std::runtime_error("computeQuadraticRhsWithMarginals: validation node index out of range.");
+            }
+
+            const Vector18d e = validation.node_errors_stacked.segment<18>(i * node_dim);
+            if (countObservedDimensions(target.observed_mask) == 0)
+            {
+                continue;
+            }
+
+            const Matrix18d& p_cov_block = getCachedNodeCovarianceBlock(cache, target.node_index);
+            const Matrix18d p_inv_observed = buildObservedInformationFromCovariance(p_cov_block, target.observed_mask);
+            rhs.segment<18>(target.node_index * node_dim) += p_inv_observed * e;
         }
         return rhs;
     }
@@ -1598,8 +1924,9 @@ namespace // anonymous
                     throw std::runtime_error("Time-prior sampling did not return any samples.");
                 }
 
-                for (const auto &sampled_state : samples)
+                for (std::size_t sample_idx = 0; sample_idx < samples.size(); ++sample_idx)
                 {
+                    const auto &sampled_state = samples[sample_idx];
                     if (sampled_state.estimation_nodes.size() != data.nodes.size())
                     {
                         throw std::runtime_error("Time-prior sampling returned an unexpected number of nodes.");
@@ -1609,13 +1936,16 @@ namespace // anonymous
                     {
                         spacetime::ValidationTarget target;
                         target.node_index = static_cast<int>(node_index);
+                        target.sample_group_id = static_cast<int>(sample_idx);
                         target.ground_truth = sampled_state.estimation_nodes[node_index];
                         target.observed_mask = validation_observed_mask;
                         data.validation_targets.push_back(target);
                     }
                 }
 
-                data.validation_variance = averageMarginalVarianceFromSamples(samples);
+                data.validation_variance = empiricalValidationVarianceFromSamples(
+                    data.nodes,
+                    samples);
             }
             else
             {
@@ -1674,6 +2004,7 @@ namespace // anonymous
 
                     spacetime::ValidationTarget target;
                     target.node_index = sample_idx;
+                    target.sample_group_id = sample_idx;
                     target.ground_truth = data.nodes[static_cast<std::size_t>(sample_idx)];
                     target.ground_truth.pose = se3::vec2tran(perturb.segment<6>(0)) * target.ground_truth.pose;
                     target.ground_truth.epsilon += perturb.segment<6>(6);
@@ -1752,6 +2083,7 @@ namespace // anonymous
                 {
                     spacetime::ValidationTarget target;
                     target.node_index = static_cast<int>(data.nodes.size() - 1);
+                    target.sample_group_id = 0;
                     target.ground_truth = node;
                     target.ground_truth.pose = measurement.value;
                     target.observed_mask = ObservedMask18::Zero();
@@ -1772,6 +2104,7 @@ namespace // anonymous
         {
             spacetime::ValidationTarget target;
             target.node_index = 0;
+            target.sample_group_id = 0;
             target.ground_truth = data.nodes.front();
             target.observed_mask = validation_observed_mask;
             if (!data.factors.empty())
@@ -2340,6 +2673,7 @@ namespace spacetime {
         Eigen::VectorXd adam_v = Eigen::VectorXd::Zero(current_psi.size());
         double beta1_power = 1.0;
         double beta2_power = 1.0;
+        double previous_loss = std::numeric_limits<double>::infinity();
         const std::filesystem::path outer_loop_log_path = resolveAssetsLogPath("bilevel_optimizer_outer_loop_" + formatTimestamp() + ".log");
         std::ofstream outer_loop_log(outer_loop_log_path, std::ios::out | std::ios::trunc);
         if (!outer_loop_log.is_open())
@@ -2356,7 +2690,8 @@ namespace spacetime {
         {
             outer_loop_log << ",dL_dlambda[" << i << "]";
         }
-        outer_loop_log << ",mean_mahalanobis,mean_logdet,validation_nll\n";
+        outer_loop_log << ",mean_mahalanobis,mean_logdet,validation_nll"
+                  << ",objective_mode,g_joint_norm,q_joint_norm,adjoint_rhs_norm,quadratic_rhs_norm,adjoint_state_norm,quadratic_state_norm,pv_min_eig,pv_max_eig,pv_condition\n";
 
         //Main optimization loop
         for (int iter = 0; iter < optimizer_config.max_iterations; ++iter)
@@ -2380,16 +2715,6 @@ namespace spacetime {
                 throw std::runtime_error("Optimizer::step requires a solved topology with valid N and K.");
             }
 
-            const MarginalCacheData marginal_cache = buildMarginalCache(solution.H, validation_targets);
-            const ValidationLossData validation = computeValidationLossWithMarginals(validation_targets, solved_nodes, marginal_cache);
-            const Eigen::VectorXd adjoint_rhs = computeAdjointRhsWithMarginals(solution.H, validation_targets, validation, marginal_cache);
-
-            result.loss = validation.loss;
-            result.iterations = iter + 1;
-            result.psi = current_psi;
-            result.lambda = lambda;
-            result.theta = theta;
-
             Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> adjoint_solver;
             adjoint_solver.compute(solution.H);
             if (adjoint_solver.info() != Eigen::Success)
@@ -2397,58 +2722,222 @@ namespace spacetime {
                 throw std::runtime_error("Optimizer::step failed to factorize the lower-level information matrix.");
             }
 
+            const bool use_joint_objective = optimizer_config.use_joint_validation_objective;
+            ValidationLossData validation;
+            Eigen::VectorXd adjoint_rhs;
+            Eigen::VectorXd quadratic_rhs;
+            Eigen::MatrixXd logdet_information;
+            std::vector<int> logdet_node_indices;
+            std::vector<JointGroupLogDetData> joint_group_logdet_data;
+            double g_joint_norm = 0.0;
+            double q_joint_norm = 0.0;
+            double pv_min_eig = 0.0;
+            double pv_max_eig = 0.0;
+            double pv_condition = 0.0;
+
+            if (use_joint_objective)
+            {
+                const std::vector<std::vector<ValidationTarget>> grouped_validation_targets =
+                    groupValidationTargetsBySample(validation_targets);
+                if (grouped_validation_targets.empty())
+                {
+                    throw std::runtime_error("Optimizer::step: grouped validation target set is empty in joint mode.");
+                }
+
+                const double group_count = static_cast<double>(grouped_validation_targets.size());
+                validation = ValidationLossData{};
+                adjoint_rhs = Eigen::VectorXd::Zero(solution.H.rows());
+                quadratic_rhs = Eigen::VectorXd::Zero(solution.H.rows());
+                joint_group_logdet_data.clear();
+                joint_group_logdet_data.reserve(grouped_validation_targets.size());
+
+                double total_loss = 0.0;
+                double total_mahalanobis_sum = 0.0;
+                double total_logdet_sum = 0.0;
+                double total_mean_nees = 0.0;
+                double total_mean_logdet = 0.0;
+                int total_effective_validation_count = 0;
+                int total_observed_dim = 0;
+                double g_joint_norm_sq_sum = 0.0;
+                double q_joint_norm_sq_sum = 0.0;
+                bool have_cov_diag = false;
+                double pv_min_eig_acc = 0.0;
+                double pv_max_eig_acc = 0.0;
+                double pv_condition_acc = 0.0;
+
+                for (const auto& target_group : grouped_validation_targets)
+                {
+                    const JointValidationCacheData group_cache =
+                        buildJointValidationCache(solution.H, target_group, solved_nodes, adjoint_solver);
+                    const ValidationLossData group_validation =
+                        computeValidationLossWithJoint(target_group, group_cache);
+
+                    total_loss += group_validation.loss;
+                    total_mahalanobis_sum += group_validation.mahalanobis_sum;
+                    total_logdet_sum += group_validation.logdet_sum;
+                    total_mean_nees += group_validation.mean_nees;
+                    total_mean_logdet += group_validation.mean_logdet;
+                    total_effective_validation_count += group_cache.effective_validation_count;
+                    total_observed_dim += group_cache.observed_dim_total;
+
+                    adjoint_rhs += computeAdjointRhsWithJoint(solution.H, target_group, group_cache);
+                    const Eigen::VectorXd group_quadratic_rhs =
+                        computeQuadraticRhsWithJoint(solution.H, target_group, group_cache);
+                    quadratic_rhs += group_quadratic_rhs;
+
+                    Eigen::VectorXd g_joint = group_cache.weighted_errors;
+                    constexpr int node_dim = 18;
+                    for (int i = 0; i < static_cast<int>(target_group.size()); ++i)
+                    {
+                        const Vector18d e = group_cache.node_errors_stacked.segment<18>(i * node_dim);
+                        Matrix18d J = Matrix18d::Identity();
+                        J.block<6, 6>(0, 0) = se3::vec2jacinv(e.segment<6>(0));
+                        g_joint.segment<18>(i * node_dim) = J.transpose() * g_joint.segment<18>(i * node_dim);
+                    }
+                    g_joint_norm_sq_sum += g_joint.squaredNorm();
+                    q_joint_norm_sq_sum += group_cache.weighted_errors.squaredNorm();
+
+                    if (group_cache.effective_validation_count > 0)
+                    {
+                        pv_min_eig_acc += group_cache.min_observed_cov_eig;
+                        pv_max_eig_acc += group_cache.max_observed_cov_eig;
+                        pv_condition_acc += group_cache.observed_cov_condition;
+                        have_cov_diag = true;
+                    }
+
+                    JointGroupLogDetData logdet_group;
+                    logdet_group.node_indices = group_cache.node_indices;
+                    logdet_group.joint_information = group_cache.joint_information;
+                    logdet_group.quadratic_state = adjoint_solver.solve(group_quadratic_rhs);
+                    if (adjoint_solver.info() != Eigen::Success)
+                    {
+                        throw std::runtime_error("Optimizer::step failed to solve group quadratic sensitivity state.");
+                    }
+
+                    const int group_block_count = static_cast<int>(group_cache.node_indices.size());
+                    Eigen::MatrixXd rhs_logdet_group = Eigen::MatrixXd::Zero(solution.H.rows(), node_dim * group_block_count);
+                    for (int u = 0; u < group_block_count; ++u)
+                    {
+                        const int node_index = group_cache.node_indices[static_cast<std::size_t>(u)];
+                        rhs_logdet_group.block(node_index * node_dim, u * node_dim, node_dim, node_dim).setIdentity();
+                    }
+                    logdet_group.logdet_projection = adjoint_solver.solve(rhs_logdet_group);
+                    if (adjoint_solver.info() != Eigen::Success)
+                    {
+                        throw std::runtime_error("Optimizer::step failed to solve group log-det sensitivity projection.");
+                    }
+                    joint_group_logdet_data.push_back(std::move(logdet_group));
+                }
+
+                adjoint_rhs /= group_count;
+                quadratic_rhs /= group_count;
+
+                validation.mahalanobis_sum = total_mahalanobis_sum / group_count;
+                validation.logdet_sum = total_logdet_sum / group_count;
+                validation.loss = total_loss / group_count;
+
+                if (total_effective_validation_count > 0)
+                {
+                    const double effective_count = static_cast<double>(total_effective_validation_count);
+                    validation.mean_nees = total_mahalanobis_sum / effective_count;
+                    validation.mean_logdet = total_logdet_sum / effective_count;
+                    validation.delta = validation.mean_nees - (static_cast<double>(total_observed_dim) / effective_count);
+                }
+                else
+                {
+                    validation.mean_nees = 0.0;
+                    validation.mean_logdet = 0.0;
+                    validation.delta = 0.0;
+                }
+
+                g_joint_norm = std::sqrt(g_joint_norm_sq_sum / group_count);
+                q_joint_norm = std::sqrt(q_joint_norm_sq_sum / group_count);
+                if (have_cov_diag)
+                {
+                    pv_min_eig = pv_min_eig_acc / group_count;
+                    pv_max_eig = pv_max_eig_acc / group_count;
+                    pv_condition = pv_condition_acc / group_count;
+                }
+            }
+            else
+            {
+                const MarginalCacheData marginal_cache = buildMarginalCache(solution.H, validation_targets);
+                validation = computeValidationLossWithMarginals(validation_targets, solved_nodes, marginal_cache);
+                adjoint_rhs = computeAdjointRhsWithMarginals(solution.H, validation_targets, validation, marginal_cache);
+                quadratic_rhs = computeQuadraticRhsWithMarginals(solution.H, validation_targets, validation, marginal_cache);
+
+                constexpr int node_dim = 18;
+                std::unordered_map<int, int> validation_node_multiplicity;
+                std::unordered_map<int, ObservedMask18> validation_node_observed_masks;
+                logdet_node_indices.reserve(validation_targets.size());
+                for (const auto &target : validation_targets)
+                {
+                    if (target.node_index < 0 || (target.node_index + 1) * node_dim > solution.H.rows())
+                    {
+                        throw std::runtime_error("Optimizer::step: validation target node index out of range for marginal log-det accumulation.");
+                    }
+
+                    auto [it, inserted] = validation_node_multiplicity.emplace(target.node_index, 1);
+                    if (inserted)
+                    {
+                        logdet_node_indices.push_back(target.node_index);
+                        validation_node_observed_masks.emplace(target.node_index, target.observed_mask);
+                    }
+                    else
+                    {
+                        ++(it->second);
+                        validation_node_observed_masks[target.node_index] =
+                            validation_node_observed_masks[target.node_index].cwiseMax(target.observed_mask);
+                    }
+                }
+
+                const int unique_validation_count = static_cast<int>(logdet_node_indices.size());
+                logdet_information = Eigen::MatrixXd::Zero(node_dim * unique_validation_count, node_dim * unique_validation_count);
+                for (int i = 0; i < unique_validation_count; ++i)
+                {
+                    const int node_index = logdet_node_indices[static_cast<std::size_t>(i)];
+                    const Matrix18d &p_cov_block = getCachedNodeCovarianceBlock(marginal_cache, node_index);
+                    const Matrix18d p_inv_block = buildObservedInformationFromCovariance(
+                        p_cov_block,
+                        validation_node_observed_masks[node_index]);
+                    const double multiplicity = static_cast<double>(validation_node_multiplicity[node_index]);
+                    logdet_information.block(i * node_dim, i * node_dim, node_dim, node_dim) = multiplicity * p_inv_block;
+                }
+            }
+
+            result.loss = validation.loss;
+            result.iterations = iter + 1;
+            result.psi = current_psi;
+            result.lambda = lambda;
+            result.theta = theta;
+
             const Eigen::VectorXd adjoint_lambda = adjoint_solver.solve(adjoint_rhs);
             if (adjoint_solver.info() != Eigen::Success)
             {
                 throw std::runtime_error("Optimizer::step failed to solve the adjoint system.");
             }
-
-            constexpr int node_dim = 18;
-            std::unordered_map<int, int> validation_node_multiplicity;
-            std::unordered_map<int, ObservedMask18> validation_node_observed_masks;
-            std::vector<int> unique_validation_nodes;
-            unique_validation_nodes.reserve(validation_targets.size());
-            for (const auto &target : validation_targets)
-            {
-                if (target.node_index < 0 || (target.node_index + 1) * node_dim > solution.H.rows())
-                {
-                    throw std::runtime_error("Optimizer::step: validation target node index out of range for log-det accumulation.");
-                }
-
-                auto [it, inserted] = validation_node_multiplicity.emplace(target.node_index, 1);
-                if (inserted)
-                {
-                    unique_validation_nodes.push_back(target.node_index);
-                    validation_node_observed_masks.emplace(target.node_index, target.observed_mask);
-                }
-                else
-                {
-                    ++(it->second);
-                    validation_node_observed_masks[target.node_index] =
-                        validation_node_observed_masks[target.node_index].cwiseMax(target.observed_mask);
-                }
-            }
-
-            const int unique_validation_count = static_cast<int>(unique_validation_nodes.size());
-            Eigen::MatrixXd rhs_logdet = Eigen::MatrixXd::Zero(solution.H.rows(), node_dim * unique_validation_count);
-            std::vector<Matrix18d> weighted_p_inv_blocks;
-            weighted_p_inv_blocks.reserve(unique_validation_nodes.size());
-            for (int i = 0; i < unique_validation_count; ++i)
-            {
-                const int node_index = unique_validation_nodes[static_cast<std::size_t>(i)];
-                rhs_logdet.block(node_index * node_dim, i * node_dim, node_dim, node_dim).setIdentity();
-                const Matrix18d &p_cov_block = getCachedNodeCovarianceBlock(marginal_cache, node_index);
-                const Matrix18d p_inv_block = buildObservedInformationFromCovariance(
-                    p_cov_block,
-                    validation_node_observed_masks[node_index]);
-                const double multiplicity = static_cast<double>(validation_node_multiplicity[node_index]);
-                weighted_p_inv_blocks.push_back(multiplicity * p_inv_block);
-            }
-
-            const Eigen::MatrixXd logdet_projection = adjoint_solver.solve(rhs_logdet);
+            const Eigen::VectorXd quadratic_state = adjoint_solver.solve(quadratic_rhs);
             if (adjoint_solver.info() != Eigen::Success)
             {
-                throw std::runtime_error("Optimizer::step failed to solve for the log-det sensitivity projection.");
+                throw std::runtime_error("Optimizer::step failed to solve the quadratic sensitivity system.");
+            }
+
+            constexpr int node_dim = 18;
+            const int logdet_block_count = static_cast<int>(logdet_node_indices.size());
+            Eigen::MatrixXd logdet_projection;
+            if (!use_joint_objective)
+            {
+                Eigen::MatrixXd rhs_logdet = Eigen::MatrixXd::Zero(solution.H.rows(), node_dim * logdet_block_count);
+                for (int u = 0; u < logdet_block_count; ++u)
+                {
+                    const int node_index = logdet_node_indices[static_cast<std::size_t>(u)];
+                    rhs_logdet.block(node_index * node_dim, u * node_dim, node_dim, node_dim).setIdentity();
+                }
+                logdet_projection = adjoint_solver.solve(rhs_logdet);
+                if (adjoint_solver.info() != Eigen::Success)
+                {
+                    throw std::runtime_error("Optimizer::step failed to solve for the log-det sensitivity projection.");
+                }
             }
 
             const std::size_t unary_count = static_cast<std::size_t>(topology.K);
@@ -2461,8 +2950,6 @@ namespace spacetime {
                 throw std::runtime_error("Optimizer::step: lower-level linearizations do not include all built-in factors.");
             }
 
-            Eigen::VectorXd global_validation_errors = Eigen::VectorXd::Zero(static_cast<int>(solved_nodes.size()) * 18);
-            Eigen::VectorXd global_observed_mask = Eigen::VectorXd::Zero(static_cast<int>(solved_nodes.size()) * 18);
             for (std::size_t i = 0; i < validation_targets.size(); ++i)
             {
                 const auto &target = validation_targets[i];
@@ -2471,16 +2958,7 @@ namespace spacetime {
                 {
                     throw std::runtime_error("Optimizer::step: validation target node index out of range.");
                 }
-                global_validation_errors.segment<18>(node_index * 18) = validation.node_errors_stacked.segment<18>(static_cast<int>(i) * 18);
-                for (int d = 0; d < 18; ++d)
-                {
-                    if (target.observed_mask(d) != 0)
-                    {
-                        global_observed_mask(node_index * 18 + d) = 1.0;
-                    }
-                }
             }
-            const Eigen::VectorXd adjoint_lambda_masked = adjoint_lambda.array() * global_observed_mask.array();
 
             Eigen::VectorXd gradient_dL_dtheta = Eigen::VectorXd::Zero(kThetaSize);
             FactorKernelSample unary_sample;
@@ -2500,7 +2978,6 @@ namespace spacetime {
                 local_nodes.reserve(lin.node_indices.size());
                 Eigen::VectorXd adjoint_lambda_f = Eigen::VectorXd::Zero(static_cast<int>(lin.node_indices.size()) * 18);
                 Eigen::VectorXd e_nodes = Eigen::VectorXd::Zero(static_cast<int>(lin.node_indices.size()) * 18);
-                Eigen::VectorXd local_observed_mask = Eigen::VectorXd::Zero(static_cast<int>(lin.node_indices.size()) * 18);
                 const int local_dim = static_cast<int>(lin.node_indices.size()) * 18;
                 Matrix18d A_logdet = Matrix18d::Zero();
 
@@ -2513,28 +2990,63 @@ namespace spacetime {
                     }
 
                     local_nodes.push_back(solved_nodes[static_cast<std::size_t>(node_index)]);
-                    adjoint_lambda_f.segment<18>(static_cast<int>(j) * 18) = adjoint_lambda_masked.segment<18>(node_index * 18);
-                    e_nodes.segment<18>(static_cast<int>(j) * 18) = global_validation_errors.segment<18>(node_index * 18);
-                    local_observed_mask.segment<18>(static_cast<int>(j) * 18) = global_observed_mask.segment<18>(node_index * 18);
+                    adjoint_lambda_f.segment<18>(static_cast<int>(j) * 18) = adjoint_lambda.segment<18>(node_index * 18);
+                    e_nodes.segment<18>(static_cast<int>(j) * 18) = quadratic_state.segment<18>(node_index * 18);
                 }
 
-                if (local_observed_mask.maxCoeff() == 0.0)
+                std::vector<Eigen::VectorXd> joint_group_e_nodes;
+                if (use_joint_objective)
                 {
-                    continue;
+                    joint_group_e_nodes.reserve(joint_group_logdet_data.size());
+                    for (const auto& group_data : joint_group_logdet_data)
+                    {
+                        Eigen::VectorXd group_e_nodes = Eigen::VectorXd::Zero(local_dim);
+                        for (std::size_t j = 0; j < lin.node_indices.size(); ++j)
+                        {
+                            const int node_index = lin.node_indices[j];
+                            group_e_nodes.segment<18>(static_cast<int>(j) * 18) =
+                                group_data.quadratic_state.segment<18>(node_index * 18);
+                        }
+                        joint_group_e_nodes.push_back(std::move(group_e_nodes));
+                    }
                 }
 
                 Eigen::MatrixXd Z_f = Eigen::MatrixXd::Zero(local_dim, local_dim);
-                for (int u = 0; u < unique_validation_count; ++u)
+                if (use_joint_objective)
                 {
-                    Eigen::MatrixXd G_local = Eigen::MatrixXd::Zero(local_dim, node_dim);
-                    for (std::size_t j = 0; j < lin.node_indices.size(); ++j)
+                    for (const auto& group_logdet : joint_group_logdet_data)
                     {
-                        const int node_index = lin.node_indices[j];
-                        G_local.block(static_cast<int>(j) * node_dim, 0, node_dim, node_dim) =
-                            logdet_projection.block(node_index * node_dim, u * node_dim, node_dim, node_dim);
+                        const int group_block_count = static_cast<int>(group_logdet.node_indices.size());
+                        Eigen::MatrixXd G_local_group = Eigen::MatrixXd::Zero(local_dim, node_dim * group_block_count);
+                        for (int u = 0; u < group_block_count; ++u)
+                        {
+                            for (std::size_t j = 0; j < lin.node_indices.size(); ++j)
+                            {
+                                const int node_index = lin.node_indices[j];
+                                G_local_group.block(static_cast<int>(j) * node_dim, u * node_dim, node_dim, node_dim) =
+                                    group_logdet.logdet_projection.block(node_index * node_dim, u * node_dim, node_dim, node_dim);
+                            }
+                        }
+                        Z_f += G_local_group * group_logdet.joint_information * G_local_group.transpose();
                     }
-
-                    Z_f += G_local * weighted_p_inv_blocks[static_cast<std::size_t>(u)] * G_local.transpose();
+                    if (!joint_group_logdet_data.empty())
+                    {
+                        Z_f /= static_cast<double>(joint_group_logdet_data.size());
+                    }
+                }
+                else
+                {
+                    Eigen::MatrixXd G_local = Eigen::MatrixXd::Zero(local_dim, node_dim * logdet_block_count);
+                    for (int u = 0; u < logdet_block_count; ++u)
+                    {
+                        for (std::size_t j = 0; j < lin.node_indices.size(); ++j)
+                        {
+                            const int node_index = lin.node_indices[j];
+                            G_local.block(static_cast<int>(j) * node_dim, u * node_dim, node_dim, node_dim) =
+                                logdet_projection.block(node_index * node_dim, u * node_dim, node_dim, node_dim);
+                        }
+                    }
+                    Z_f = G_local * logdet_information * G_local.transpose();
                 }
 
                 if (lin.E.rows() != 18 || lin.Q.rows() != 18 || lin.Q.cols() != 18)
@@ -2557,9 +3069,34 @@ namespace spacetime {
                         unary_sample.e_nodes = e_nodes;
                         unary_sample.info_scale = kNllQuadraticScale;
                     }
-                    const FactorGradientContrib contrib = computeDiagonalFactorGradient(lin.e, lin.Q, lin.E, adjoint_lambda_f, e_nodes, kNllQuadraticScale);
-                    std::cout << "Node index: " << lin.node_indices[0] << ", contrib.dL_dtheta_state: " << contrib.dL_dtheta_state.transpose() << ", contrib.dL_dtheta_info: " << contrib.dL_dtheta_info.transpose() << std::endl;
-                    gradient_dL_dtheta.segment<18>(0) += contrib.dL_dtheta_state + contrib.dL_dtheta_info;
+                    const Eigen::VectorXd zero_e_nodes = Eigen::VectorXd::Zero(18);
+                    const FactorGradientContrib state_contrib = computeDiagonalFactorGradient(
+                        lin.e,
+                        lin.Q,
+                        lin.E,
+                        adjoint_lambda_f,
+                        zero_e_nodes,
+                        kNllQuadraticScale);
+                    Eigen::VectorXd info_gradient = Eigen::VectorXd::Zero(18);
+                    if (use_joint_objective)
+                    {
+                        for (const Eigen::VectorXd& group_e_nodes : joint_group_e_nodes)
+                        {
+                            info_gradient += computeDiagonalFactorGradient(
+                                lin.e, lin.Q, lin.E, adjoint_lambda_f, group_e_nodes, kNllQuadraticScale).dL_dtheta_info;
+                        }
+                        info_gradient /= static_cast<double>(joint_group_e_nodes.size());
+                    }
+                    else
+                    {
+                        info_gradient = computeDiagonalFactorGradient(
+                            lin.e, lin.Q, lin.E, adjoint_lambda_f, e_nodes, kNllQuadraticScale).dL_dtheta_info;
+                    }
+
+                    std::cout << "Node index: " << lin.node_indices[0]
+                              << ", contrib.dL_dtheta_state: " << state_contrib.dL_dtheta_state.transpose()
+                              << ", contrib.dL_dtheta_info: " << info_gradient.transpose() << std::endl;
+                    gradient_dL_dtheta.segment<18>(0) += state_contrib.dL_dtheta_state + info_gradient;
                     gradient_dL_dtheta.segment<18>(0) += computeUnaryLogDetGradientFromTrace(A_logdet);
                     continue;
                 }
@@ -2588,9 +3125,35 @@ namespace spacetime {
                         space_sample.e_nodes = e_nodes;
                         space_sample.info_scale = kNllQuadraticScale;
                     }
-                    const FactorGradientContrib contrib = computeBinarySpaceFactorGradient(local_nodes, lin.e, lin.Q, lin.E, adjoint_lambda_f, e_nodes, kNllQuadraticScale);
-                    gradient_dL_dtheta.segment<6>(24) += contrib.dL_dtheta_state.segment<6>(0) + contrib.dL_dtheta_info.segment<6>(0); // Q2
-                    gradient_dL_dtheta.segment<6>(30) += contrib.dL_dtheta_state.segment<6>(6) + contrib.dL_dtheta_info.segment<6>(6); // Q3
+                    const Eigen::VectorXd zero_e_nodes = Eigen::VectorXd::Zero(local_dim);
+                    const FactorGradientContrib state_contrib = computeBinarySpaceFactorGradient(
+                        local_nodes,
+                        lin.e,
+                        lin.Q,
+                        lin.E,
+                        adjoint_lambda_f,
+                        zero_e_nodes,
+                        kNllQuadraticScale);
+                    Eigen::VectorXd info_gradient = Eigen::VectorXd::Zero(12);
+                    if (use_joint_objective)
+                    {
+                        for (const Eigen::VectorXd& group_e_nodes : joint_group_e_nodes)
+                        {
+                            info_gradient += computeBinarySpaceFactorGradient(
+                                local_nodes, lin.e, lin.Q, lin.E, adjoint_lambda_f,
+                                group_e_nodes, kNllQuadraticScale).dL_dtheta_info;
+                        }
+                        info_gradient /= static_cast<double>(joint_group_e_nodes.size());
+                    }
+                    else
+                    {
+                        info_gradient = computeBinarySpaceFactorGradient(
+                            local_nodes, lin.e, lin.Q, lin.E, adjoint_lambda_f,
+                            e_nodes, kNllQuadraticScale).dL_dtheta_info;
+                    }
+
+                    gradient_dL_dtheta.segment<6>(24) += state_contrib.dL_dtheta_state.segment<6>(0) + info_gradient.segment<6>(0); // Q2
+                    gradient_dL_dtheta.segment<6>(30) += state_contrib.dL_dtheta_state.segment<6>(6) + info_gradient.segment<6>(6); // Q3
                     const Eigen::VectorXd logdet_contrib = computeBinarySpaceLogDetGradientFromTrace(local_nodes, A_logdet);
                     gradient_dL_dtheta.segment<6>(24) += logdet_contrib.segment<6>(0);
                     gradient_dL_dtheta.segment<6>(30) += logdet_contrib.segment<6>(6);
@@ -2611,9 +3174,35 @@ namespace spacetime {
                         time_sample.info_scale = kNllQuadraticScale;
                     }
 
-                    const FactorGradientContrib contrib = computeBinaryTimeFactorGradient(local_nodes, lin.e, lin.Q, lin.E, adjoint_lambda_f, e_nodes, kNllQuadraticScale);
-                    gradient_dL_dtheta.segment<6>(18) += contrib.dL_dtheta_state.segment<6>(0) + contrib.dL_dtheta_info.segment<6>(0); // Q1
-                    gradient_dL_dtheta.segment<6>(30) += contrib.dL_dtheta_state.segment<6>(6) + contrib.dL_dtheta_info.segment<6>(6); // Q3
+                    const Eigen::VectorXd zero_e_nodes = Eigen::VectorXd::Zero(local_dim);
+                    const FactorGradientContrib state_contrib = computeBinaryTimeFactorGradient(
+                        local_nodes,
+                        lin.e,
+                        lin.Q,
+                        lin.E,
+                        adjoint_lambda_f,
+                        zero_e_nodes,
+                        kNllQuadraticScale);
+                    Eigen::VectorXd info_gradient = Eigen::VectorXd::Zero(12);
+                    if (use_joint_objective)
+                    {
+                        for (const Eigen::VectorXd& group_e_nodes : joint_group_e_nodes)
+                        {
+                            info_gradient += computeBinaryTimeFactorGradient(
+                                local_nodes, lin.e, lin.Q, lin.E, adjoint_lambda_f,
+                                group_e_nodes, kNllQuadraticScale).dL_dtheta_info;
+                        }
+                        info_gradient /= static_cast<double>(joint_group_e_nodes.size());
+                    }
+                    else
+                    {
+                        info_gradient = computeBinaryTimeFactorGradient(
+                            local_nodes, lin.e, lin.Q, lin.E, adjoint_lambda_f,
+                            e_nodes, kNllQuadraticScale).dL_dtheta_info;
+                    }
+
+                    gradient_dL_dtheta.segment<6>(18) += state_contrib.dL_dtheta_state.segment<6>(0) + info_gradient.segment<6>(0); // Q1
+                    gradient_dL_dtheta.segment<6>(30) += state_contrib.dL_dtheta_state.segment<6>(6) + info_gradient.segment<6>(6); // Q3
                     const Eigen::VectorXd logdet_contrib = computeBinaryTimeLogDetGradientFromTrace(local_nodes, A_logdet);
                     gradient_dL_dtheta.segment<6>(18) += logdet_contrib.segment<6>(0);
                     gradient_dL_dtheta.segment<6>(30) += logdet_contrib.segment<6>(6);
@@ -2647,7 +3236,13 @@ namespace spacetime {
                 dL_dpsi.segment<12>(6).setZero();
             }
 
-            const double grad_norm = dL_dlambda.norm();
+            const double grad_norm = dL_dpsi.norm();
+            const double loss_change = std::abs(validation.loss - previous_loss);
+            const double adjoint_rhs_norm = adjoint_rhs.norm();
+            const double quadratic_rhs_norm = quadratic_rhs.norm();
+            const double adjoint_state_norm = adjoint_lambda.norm();
+            const double quadratic_state_norm = quadratic_state.norm();
+            const std::string objective_mode = use_joint_objective ? "joint" : "marginal";
             if (optimizer_config.verbose)
             {
                 std::cout << "Outer iteration " << iter
@@ -2659,7 +3254,21 @@ namespace spacetime {
                           << ", lambda_max=" << lambda.maxCoeff()
                           << ", theta_min=" << theta.minCoeff()
                           << ", theta_max=" << theta.maxCoeff()
+                          << ", objective_mode=" << objective_mode
                           << std::endl;
+                if (optimizer_config.log_joint_diagnostics)
+                {
+                    std::cout << "Path diagnostics: g_joint_norm=" << g_joint_norm
+                              << ", q_joint_norm=" << q_joint_norm
+                              << ", adjoint_rhs_norm=" << adjoint_rhs_norm
+                              << ", quadratic_rhs_norm=" << quadratic_rhs_norm
+                              << ", adjoint_state_norm=" << adjoint_state_norm
+                              << ", quadratic_state_norm=" << quadratic_state_norm
+                              << ", pv_min_eig=" << pv_min_eig
+                              << ", pv_max_eig=" << pv_max_eig
+                              << ", pv_condition=" << pv_condition
+                              << std::endl;
+                }
             }
 
             outer_loop_log << iter;
@@ -2671,12 +3280,25 @@ namespace spacetime {
             {
                 outer_loop_log << ',' << dL_dlambda[i];
             }
-            outer_loop_log << ',' << validation.mean_nees << ',' << validation.mean_logdet << ',' << validation.loss << '\n';
-            if (grad_norm < optimizer_config.tol_grad)
+            outer_loop_log << ',' << validation.mean_nees << ',' << validation.mean_logdet << ',' << validation.loss
+                          << ',' << objective_mode
+                          << ',' << g_joint_norm
+                          << ',' << q_joint_norm
+                          << ',' << adjoint_rhs_norm
+                          << ',' << quadratic_rhs_norm
+                          << ',' << adjoint_state_norm
+                          << ',' << quadratic_state_norm
+                          << ',' << pv_min_eig
+                          << ',' << pv_max_eig
+                          << ',' << pv_condition
+                          << '\n';
+            if (grad_norm < optimizer_config.tol_grad ||
+                (iter > 0 && loss_change < optimizer_config.tol_loss))
             {
                 result.converged = true;
                 break;
             }
+            previous_loss = validation.loss;
 
             Eigen::VectorXd update_direction = dL_dpsi;
             if (optimizer_config.use_adam)
@@ -2745,7 +3367,7 @@ namespace spacetime {
             validation_precision(i) = (v > 0.0) ? (1.0 / v) : 0.0;
         }
         outer_loop_log << "\nrun_summary\n";
-        outer_loop_log << "N,K,tol_grad,tol_loss,learning_rate,R_pose,R_gyro,validation_sample_count,validation_precision,converged\n";
+        outer_loop_log << "N,K,tol_grad,tol_loss,learning_rate,R_pose,R_gyro,validation_sample_count,validation_precision,objective_mode,converged\n";
         outer_loop_log << problem_->robotTopology().N << ','
                        << problem_->robotTopology().K << ','
                        << optimizer_config.tol_grad << ','
@@ -2755,6 +3377,7 @@ namespace spacetime {
                        << '"' << formatVector(summary.R_gyro) << '"' << ','
                        << summary.validation_sample_count << ','
                        << '"' << formatVector(validation_precision) << '"' << ','
+                   << (optimizer_config.use_joint_validation_objective ? "joint" : "marginal") << ','
                        << (result.converged ? "true" : "false") << '\n';
         return result;
     }
