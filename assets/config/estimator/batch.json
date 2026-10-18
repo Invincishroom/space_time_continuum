@@ -6,9 +6,8 @@
         "compute_covariances": true
     },
     "optimizer": {
-        "convergence_threshold": 1e-1, 
-        "max_iterations": 13,
-        "line_search": false, 
+        "convergence_threshold": 1e-1,
+        "max_iterations": 50, 
         "kirchoff": false,
         "LM_damping": 0,
         "use_autodiff": false

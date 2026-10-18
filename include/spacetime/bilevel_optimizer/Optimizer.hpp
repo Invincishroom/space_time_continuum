@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 #include <vector>
 #include "OptimizationProblem.hpp"
 
@@ -19,8 +20,10 @@ public:
     };
     struct OptimizerConfig {
         int max_iterations = 100;
-        double learning_rate = 0.01;
-        bool use_adam = true;
+        double learning_rate = 0.05;
+        bool enable_oscillation_detection = true;
+        std::string parameter_checkpoint_path;
+        bool use_adam = false;
         double adam_beta1 = 0.9;
         double adam_beta2 = 0.999;
         double adam_epsilon = 1e-8;
@@ -35,20 +38,23 @@ public:
         double gradient_fd_epsilon = 1e-6; // central-difference epsilon for gradient checks
         bool gradient_fd_use_lambda_perturbation = true; // if true, perturb lambda and chain-rule back to theta for FD checks
         bool freeze_p0_non_pose = false; // if true, freeze lambda[6..17] so only pose-related P0 terms are updated
+        std::vector<int> lambda_update_mask = std::vector<int>(OptimizationProblem::ParameterCount, 1);
         bool use_joint_validation_objective = false; // if true, use full joint validation covariance objective; otherwise use marginal objective
         bool log_joint_diagnostics = true; // if true, log pathway norms/conditioning diagnostics per iteration
         double max_gradient_update_norm = 1e4; // clip update direction norm before applying optimizer step
         double max_psi_step_norm = 0.5; // clip per-iteration psi update norm
         double min_theta = 1e-8; // lower clamp for theta after inversion
-        double max_theta = 1e3; // upper clamp for theta after inversion
+        double max_theta = 1e5; // upper clamp for theta after inversion
     } optimizer_config;
     std::shared_ptr<OptimizationProblem> problem_;
     Optimizer(const OptimizationProblem& problem);
+    void setScenarioProblems(const std::vector<OptimizationProblem>& problems);
     void setConfig(const OptimizerConfig& cfg);
     // Run the outer optimization loop; returns final state.
     Result optimize();
 
 private:
+    std::vector<std::shared_ptr<OptimizationProblem>> scenario_problems_;
 
     // Single outer iteration: assemble Q, solve lower level, compute adjoint,
     // accumulate gradients and perform psi update.

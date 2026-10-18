@@ -82,7 +82,9 @@ int main(int argc, char *argv[])
     if (options.estimator_type == Spacetime::Options::EstimatorType::Batch)
     {
         info("Using batch estimator.");
-        topology.T = measurements.back()->getMeas().t - topology.t0; // Set T based on measurement times and start time t0
+        const double end_time = data_options.end_time < std::numeric_limits<double>::max()
+            ? data_options.end_time : measurements.back()->getMeas().t;
+        topology.T = end_time - topology.t0;
         topology.K = (unsigned int)std::ceil(topology.K * topology.T) + 1; // Set K based on K_per_second and total time T
         state_estimator = new Spacetime::Estimator(topology, params, options);
     }

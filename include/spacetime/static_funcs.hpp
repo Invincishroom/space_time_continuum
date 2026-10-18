@@ -32,21 +32,21 @@ namespace Spacetime
     };
 
     template <typename U = DTYPE, typename T = double>
-    static Eigen::Matrix<U, 18, 18> getQs(T ds, const Eigen::Matrix<T, 6, 6> &Q2, const Eigen::Matrix<T, 6, 6> &Q3, const typename SystemState<U>::Node &node)
+    static Eigen::Matrix<U, 18, 18> getQs(T ds, const Eigen::Matrix<T, 6, 6> &Q2, const Eigen::Matrix<T, 6, 6> &Q4, const typename SystemState<U>::Node &node)
     {
         assert(ds > 0 && "Arclength must be positive.");
         const U _ds = U(ds);
         const U _ds2 = _ds * _ds / 2.0;
         const U _ds3 = _ds * _ds * _ds / 3.0;
         Eigen::Matrix<U, 6, 6> _Q2 = Q2.template cast<U>();
-        Eigen::Matrix<U, 6, 6> _Q3 = Q3.template cast<U>();
+        Eigen::Matrix<U, 6, 6> _Q4 = Q4.template cast<U>();
         Eigen::Matrix<U, 6, 6> varpihat = se3::curlyhat(node.varpi);
 
         Eigen::Matrix<U, 18, 18> Qs;
-        // Qs << _ds3 * _Q2, _ds2 * _Q2, ZERO<U>(6),
-        //     _ds2 * _Q2, _ds * _Q2, ZERO<U>(6),
-        //     ZERO<U>(6), ZERO<U>(6), _ds * _Q3; // Original 1D interp 
-
+        Qs << _ds3 * _Q2, _ds2 * _Q2, ZERO<U>(6),
+             _ds2 * _Q2, _ds * _Q2, ZERO<U>(6),
+             ZERO<U>(6), ZERO<U>(6), _ds * _Q4; 
+        /*
         Qs << _ds3 * _Q2,
             _ds2 * _Q2,
             -_ds3 * _Q2 * varpihat.transpose(),
@@ -56,7 +56,7 @@ namespace Spacetime
             -_ds3 * varpihat * _Q2,
             -_ds2 * varpihat * _Q2,
             _ds * _Q3 + _ds3 * varpihat * _Q2 * varpihat.transpose();
-
+        */  
         return Qs;
     }; // TODO: commit to removing node from this function if not used
 
@@ -77,18 +77,20 @@ namespace Spacetime
     };
 
     template <typename U = DTYPE, typename T = double>
-    static Eigen::Matrix<U, 18, 18> getQsInv(T ds, const Eigen::Matrix<T, 6, 6> &Q2, const Eigen::Matrix<T, 6, 6> &Q3, const typename SystemState<U>::Node &node)
+    static Eigen::Matrix<U, 18, 18> getQsInv(T ds, const Eigen::Matrix<T, 6, 6> &Q2, const Eigen::Matrix<T, 6, 6> &Q4, const typename SystemState<U>::Node &node)
     {
         assert(ds > 0 && "Arclength must be positive.");
-        return getQs(ds, Q2, Q3, node).inverse();
-        // const U _ds = U(ds);
-        // Eigen::Matrix<U, 6, 6> Q3_inv = invertDiagonal(Q3);
-        // Eigen::Matrix<U, 6, 6> Q2_inv = invertDiagonal(Q2);
+        //return getQs(ds, Q2, Q3, node).inverse();
+        const U _ds = U(ds);
+        Eigen::Matrix<U, 6, 6> Q4_inv = invertDiagonal(Q4).template cast<U>();
+        Eigen::Matrix<U, 6, 6> Q2_inv = invertDiagonal(Q2).template cast<U>();
 
-        // Eigen::Matrix<U, 18, 18> Qs_inv;
-        // Qs_inv << 12.0 * Q2_inv / (_ds * _ds * _ds), -6.0 * Q2_inv / (_ds * _ds), ZERO<U>(6),
-        //     -6.0 * Q2_inv / (_ds * _ds), 4.0 * Q2_inv / _ds, ZERO<U>(6),
-        //     ZERO<U>(6), ZERO<U>(6), 1.0 * Q3_inv / _ds;
+        Eigen::Matrix<U, 18, 18> Qs_inv;
+        Qs_inv << 12.0 * Q2_inv / (_ds * _ds * _ds), -6.0 * Q2_inv / (_ds * _ds), ZERO<U>(6),
+            -6.0 * Q2_inv / (_ds * _ds), 4.0 * Q2_inv / _ds, ZERO<U>(6),
+            ZERO<U>(6), ZERO<U>(6), 1.0 * Q4_inv / _ds;
+
+        return Qs_inv;
 
         // return Qs_inv;
     };

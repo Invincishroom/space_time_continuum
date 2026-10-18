@@ -1,4 +1,6 @@
 #include <filesystem>
+#include <cmath>
+#include <iomanip>
 
 #include "export_tools.hpp"
 #include "spacetime/static_funcs.hpp"
@@ -110,9 +112,30 @@ namespace Spacetime
 
         // Interpolate the states at the ground truth measurements
         _state.interpolation_nodes.clear();
+        std::ofstream metrics(output_path + "/logs/pose_metrics.csv");
+        if (!metrics)
+            throw std::runtime_error("Cannot open pose_metrics.csv for export.");
+        metrics << std::setprecision(17);
+        metrics << "time,arclength,translation_error_m,rotation_error_rad,marginal_nees,translation_nees,rotation_nees\n";
+        const double start_time = _state.estimation_nodes.front().time;
+        const double end_time = _state.estimation_nodes.back().time;
+        std::vector<SensorMeasurement> in_range_gt;
+        const auto compute_nees = [](const Eigen::VectorXd &residual, const Eigen::MatrixXd &covariance) {
+            Eigen::LDLT<Eigen::MatrixXd> solver(covariance);
+            if (covariance.allFinite() && solver.info() == Eigen::Success &&
+                solver.vectorD().minCoeff() > 0.0)
+            {
+                const double nees = residual.dot(solver.solve(residual));
+                if (std::isfinite(nees) && nees >= 0.0)
+                    return nees;
+            }
+            return std::numeric_limits<double>::quiet_NaN();
+        };
         for (const auto &measurement : gt)
         {
             assert(measurement.type == SensorMeasurement::Pose && "Ground truth measurements must be of type Pose.");
+            if (measurement.t < start_time - TOLERANCE || measurement.t > end_time + TOLERANCE)
+                continue;
 
             SystemState<DTYPE>::Node node;
             node.arclength = measurement.s;
@@ -123,7 +146,34 @@ namespace Spacetime
             else
                 estimator->interpolateMean2D(node, _state);
             _state.interpolation_nodes.push_back(node);
+            in_range_gt.push_back(measurement);
+            const Eigen::Matrix<double, 4, 4> error_transform = invertTransformation(
+                node.pose.template cast<double>() * measurement.value.template cast<double>());
+            const Eigen::Matrix<double, 6, 1> error = se3::tran2vec(error_transform);
+            metrics << node.time << ',' << node.arclength << ','
+                    << error_transform.block<3, 1>(0, 3).norm() << ',' << error.tail<3>().norm() << ',';
+            Eigen::Vector3d nees_values = Eigen::Vector3d::Constant(std::numeric_limits<double>::quiet_NaN());
+            if (node.covarianceAvailable())
+            {
+                const Eigen::Matrix<double, 6, 6> covariance = node.getCovariance().block<6, 6>(0, 0);
+                const Eigen::Matrix<double, 6, 6> symmetric_covariance =
+                    0.5 * (covariance + covariance.transpose());
+                nees_values(0) = compute_nees(error, symmetric_covariance);
+                nees_values(1) = compute_nees(error.head<3>(), symmetric_covariance.topLeftCorner<3, 3>());
+                nees_values(2) = compute_nees(error.tail<3>(), symmetric_covariance.bottomRightCorner<3, 3>());
+            }
+            for (int component = 0; component < nees_values.size(); ++component)
+            {
+                if (component > 0)
+                    metrics << ',';
+                if (std::isfinite(nees_values(component)))
+                    metrics << nees_values(component);
+            }
+            metrics << '\n';
         }
+        metrics.close();
+        if (!metrics)
+            throw std::runtime_error("Failed to write pose_metrics.csv.");
 
         _state.convertStateMeanBodyInertial(); // Switches to ib form
 
@@ -134,7 +184,7 @@ namespace Spacetime
 
             size_t index = 0;
             *log_file_stream << "time,arclength,x1,x2,x3,x4,x5,x6,e1,e2,e3,e4,e5,e6,v1,v2,v3,v4,v5,v6," << std::endl;
-            for (auto &measurement : gt)
+            for (const auto &measurement : in_range_gt)
             {
                 assert(index < _state.interpolation_nodes.size() && "Ground truth measurements must match the interpolation nodes size.");
                 assert(std::abs(measurement.t - _state.interpolation_nodes[index].time) < TOLERANCE && "Ground truth measurements must match the interpolation nodes time within the tolerance.");
@@ -167,7 +217,7 @@ namespace Spacetime
 
             size_t index = 0;
             *log_file_stream << "time,arclength," << std::endl;
-            for (auto &measurement : gt)
+            for (const auto &measurement : in_range_gt)
             {
                 assert(index < _state.interpolation_nodes.size() && "Ground truth measurements must match the interpolation nodes size.");
                 assert(std::abs(measurement.t - _state.interpolation_nodes[index].time) < TOLERANCE && "Ground truth measurements must match the interpolation nodes time within the tolerance.");
@@ -198,7 +248,7 @@ namespace Spacetime
             log_file_stream->open(log_file_path, std::ios::out);
 
             *log_file_stream << "time,arclength,x1,x2,x3,x4,x5,x6," << std::endl;
-            for (auto &measurement : gt)
+            for (const auto &measurement : in_range_gt)
             {
                 *log_file_stream << measurement.t << "," << measurement.s << ",";
                 Eigen::Matrix<double, 6, 1> measurement_value = se3::tran2vec(measurement.value);

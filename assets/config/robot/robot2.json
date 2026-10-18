@@ -9,6 +9,7 @@
         "Q1": [3e1, 3e1, 3e1, 8e3, 8e3, 8e3], // varpi time -- lower linear = lower bubbling and high freq filter 
         "Q2": [8e-1, 8e-1, 8e-1, 1e3, 1e3, 1e3], // epsilon space
         "Q3": [8e-1, 8e-1, 8e-1, 1e4, 1e4, 1e4], // epsilon time
+        "Q4": [3e1, 3e1, 3e1, 5e1, 5e1, 5e1],
         "prior_factor": 0.15, 
         "R_pose": [2e-5, 2e-5, 2e-5, 2.5e-3, 2.5e-3, 2.5e-3],
         "R_gyro": [1e-6, 1e-6, 1e-6],
@@ -26,4 +27,5 @@
         "lock_last_strain": false,
         "time_nodes_on_measurements": false,
         "use_1D_estimator": false
+    }
 }

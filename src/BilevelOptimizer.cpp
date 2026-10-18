@@ -1,4 +1,5 @@
 #include "spacetime/bilevel_optimizer.hpp"
+#include "spacetime/bilevel_optimizer/OscillationDetector.hpp"
 #include "spacetime/bilevel_optimizer/FactorGradient.hpp"
 #include "spacetime/bilevel_optimizer/GradientAccumulator.hpp"
 #include "spacetime/estimators/Estimator.hpp"
@@ -38,6 +39,115 @@ namespace // anonymous
     using Matrix18d = Eigen::Matrix<double, 18, 18>;
     using Vector18d = Eigen::Matrix<double, 18, 1>;
 
+    struct TemporalValidationData
+    {
+        Spacetime::SystemState<DTYPE>::Node estimate;
+        std::vector<int> support;
+        Eigen::MatrixXd pose_jacobian;
+        Eigen::Matrix<double, 6, 6> bridge_map = Eigen::Matrix<double, 6, 6>::Zero();
+        double duration = 0.0;
+        double offset = 0.0;
+    };
+
+    TemporalValidationData interpolateValidationTime(
+        const spacetime::ValidationTarget& target,
+        const std::vector<Spacetime::SystemState<DTYPE>::Node>& nodes)
+    {
+        TemporalValidationData out;
+        const auto& snapped = nodes.at(static_cast<std::size_t>(target.node_index));
+        out.estimate = snapped;
+        out.support = {target.node_index};
+        out.pose_jacobian = Eigen::MatrixXd::Zero(6, 18);
+        out.pose_jacobian.leftCols<6>().setIdentity();
+        if (!target.interpolate_time)
+        {
+            return out;
+        }
+        if (target.observed_mask.tail<12>().any())
+        {
+            throw std::runtime_error("Temporal GT validation supports pose observations only.");
+        }
+
+        int left = -1;
+        int right = -1;
+        const double time = target.ground_truth.time;
+        for (int index = 0; index < static_cast<int>(nodes.size()); ++index)
+        {
+            const auto& node = nodes[static_cast<std::size_t>(index)];
+            if (std::abs(node.arclength - snapped.arclength) > TOLERANCE)
+            {
+                continue;
+            }
+            if (std::abs(node.time - time) < 1e-10)
+            {
+                out.estimate = node;
+                out.support = {index};
+                return out;
+            }
+            if (node.time < time && (left < 0 || node.time > nodes[left].time))
+            {
+                left = index;
+            }
+            if (node.time > time && (right < 0 || node.time < nodes[right].time))
+            {
+                right = index;
+            }
+        }
+        if (left < 0 || right < 0)
+        {
+            throw std::runtime_error("Vicon validation timestamp is outside the state grid.");
+        }
+
+        const auto& node0 = nodes[left];
+        const auto& node1 = nodes[right];
+        out.duration = node1.time - node0.time;
+        out.offset = time - node0.time;
+        const double alpha = out.offset / out.duration;
+        const double pose_weight = alpha * alpha * (3.0 - 2.0 * alpha);
+        const double velocity0_weight = out.duration * alpha * (1.0 - alpha) * (1.0 - alpha);
+        const double velocity1_weight = out.duration * alpha * alpha * (alpha - 1.0);
+        const Eigen::Matrix4d relative = (node1.pose * invertTransformation(node0.pose)).template cast<double>();
+        const Eigen::Matrix<double, 6, 1> xi = se3::tran2vec(relative);
+        const Eigen::Matrix<double, 6, 6> inverse_jacobian = se3::vec2jacinv(xi);
+        const Eigen::Matrix<double, 6, 1> velocity0 = node0.varpi.template cast<double>();
+        const Eigen::Matrix<double, 6, 1> velocity1 = node1.varpi.template cast<double>();
+        const Eigen::Matrix<double, 6, 1> query_xi =
+            pose_weight * xi + velocity0_weight * velocity0 + velocity1_weight * inverse_jacobian * velocity1;
+        out.bridge_map = se3::vec2jac(query_xi);
+        const Eigen::Matrix4d increment = se3::vec2tran(query_xi);
+        out.estimate.pose = (increment * node0.pose.template cast<double>()).template cast<DTYPE>();
+        out.estimate.epsilon = (out.bridge_map *
+            ((1.0 - alpha) * node0.epsilon.template cast<double>() +
+             alpha * inverse_jacobian * node1.epsilon.template cast<double>())).template cast<DTYPE>();
+        out.estimate.varpi = (out.bridge_map *
+            (6.0 * alpha * (1.0 - alpha) / out.duration * xi +
+             (3.0 * alpha * alpha - 4.0 * alpha + 1.0) * velocity0 +
+             (3.0 * alpha * alpha - 2.0 * alpha) * inverse_jacobian * velocity1)).template cast<DTYPE>();
+        out.estimate.time = time;
+        out.support = {left, right};
+
+        Eigen::Matrix<double, 6, 6> velocity_transport_derivative;
+        const double step = 1e-5;
+        for (int dimension = 0; dimension < 6; ++dimension)
+        {
+            Eigen::Matrix<double, 6, 1> plus = xi;
+            Eigen::Matrix<double, 6, 1> minus = xi;
+            plus(dimension) += step;
+            minus(dimension) -= step;
+            velocity_transport_derivative.col(dimension) =
+                (se3::vec2jacinv(plus) * velocity1 - se3::vec2jacinv(minus) * velocity1) / (2.0 * step);
+        }
+        const Eigen::Matrix<double, 6, 6> pose_derivative =
+            out.bridge_map * (pose_weight * Eigen::Matrix<double, 6, 6>::Identity() +
+                              velocity1_weight * velocity_transport_derivative) * inverse_jacobian;
+        out.pose_jacobian = Eigen::MatrixXd::Zero(6, 36);
+        out.pose_jacobian.block<6, 6>(0, 0) = se3::tranAd(increment) - pose_derivative * se3::tranAd(relative);
+        out.pose_jacobian.block<6, 6>(0, 12) = velocity0_weight * out.bridge_map;
+        out.pose_jacobian.block<6, 6>(0, 18) = pose_derivative;
+        out.pose_jacobian.block<6, 6>(0, 30) = velocity1_weight * out.bridge_map * inverse_jacobian;
+        return out;
+    }
+
     struct MarginalCacheData
     {
         std::unordered_map<int, Matrix18d> node_covariance_blocks;
@@ -48,12 +158,22 @@ namespace // anonymous
 
     struct JointValidationCacheData
     {
+        bool full_state_observation = false;
+        bool joint_observations = true;
         std::vector<int> node_indices;
+        std::vector<TemporalValidationData> temporal_targets;
+        std::vector<std::array<int, 18>> observed_columns;
+        Eigen::SparseMatrix<double> observation_projection;
+        Eigen::Matrix<double, 6, 6> temporal_q1 = Eigen::Matrix<double, 6, 6>::Zero();
         std::vector<Eigen::Matrix<int, 18, 1>> observed_masks;
+        std::vector<int> observed_stacked_indices;
         Eigen::VectorXd node_errors_stacked;
         Eigen::MatrixXd h_inv_selector;
+        Eigen::MatrixXd weighted_projection;
         Eigen::MatrixXd joint_covariance;
         Eigen::MatrixXd joint_information;
+        std::vector<Eigen::MatrixXd> marginal_information;
+        std::vector<int> marginal_offsets;
         Eigen::VectorXd weighted_errors;
         int effective_validation_count = 0;
         int observed_dim_total = 0;
@@ -62,14 +182,26 @@ namespace // anonymous
         double min_observed_cov_eig = 0.0;
         double max_observed_cov_eig = 0.0;
         double observed_cov_condition = 0.0;
+        double setup_ms = 0.0;
+        double selector_ms = 0.0;
+        double projection_solve_ms = 0.0;
+        double covariance_ms = 0.0;
+        double eigendecomposition_ms = 0.0;
+        double information_ms = 0.0;
     };
 
     struct JointGroupLogDetData
     {
-        std::vector<int> node_indices;
-        Eigen::MatrixXd joint_information;
-        Eigen::MatrixXd logdet_projection;
         Eigen::VectorXd quadratic_state;
+    };
+
+    struct JointValidationGroupData
+    {
+        Eigen::VectorXd node_errors_stacked;
+        Eigen::VectorXd weighted_errors;
+        Eigen::VectorXd covariance_state_gradient;
+        Eigen::VectorXd covariance_theta_gradient = Eigen::VectorXd::Zero(spacetime::OptimizationProblem::ParameterCount);
+        double mahalanobis_sum = 0.0;
     };
 
     struct FactorKernelSample
@@ -84,12 +216,13 @@ namespace // anonymous
         double info_scale = 0.0;
     };
 
-    constexpr int kThetaSize = 36;
+    constexpr int kThetaSize = spacetime::OptimizationProblem::ParameterCount;
     constexpr int kNodeDim = 18;
     constexpr int kP0Offset = 0;
     constexpr int kQ1Offset = 18;
     constexpr int kQ2Offset = 24;
     constexpr int kQ3Offset = 30;
+    constexpr int kQ4Offset = 36;
 
     using ObservedMask18 = Eigen::Matrix<int, 18, 1>;
 
@@ -122,12 +255,30 @@ namespace // anonymous
 
     ObservedMask18 buildObservedMaskFromTrialDataFlags(const Json::Value &trial_data_root)
     {
-        (void)trial_data_root;
-
         ObservedMask18 mask = ObservedMask18::Zero();
-        // Observe the full 18-dimensional variance state for validation so the
-        // ground-truth comparison covers every dimension.
-        mask.setOnes();
+        const bool observe_pose = trial_data_root.get("aurora", false).asBool() ||
+                                  trial_data_root.get("lidar", false).asBool();
+        if (observe_pose)
+        {
+            mask.segment<6>(0).setOnes();
+        }
+        if (trial_data_root.get("fbgs", false).asBool())
+        {
+            mask.segment<6>(6).setOnes();
+        }
+        if (trial_data_root.get("velocity", false).asBool())
+        {
+            mask.segment<3>(12).setOnes();
+        }
+        if (trial_data_root.get("gyro", false).asBool())
+        {
+            mask.segment<3>(15).setOnes();
+        }
+
+        if (mask.isZero())
+        {
+            throw std::runtime_error("At least one observed validation dimension must be enabled in the trial data flags.");
+        }
         return mask;
     }
 
@@ -507,6 +658,14 @@ namespace // anonymous
         {
             config.learning_rate = root["learning_rate"].asDouble();
         }
+        if (root.isMember("enable_oscillation_detection"))
+        {
+            if (!root["enable_oscillation_detection"].isBool())
+            {
+                throw std::runtime_error("enable_oscillation_detection must be a boolean.");
+            }
+            config.enable_oscillation_detection = root["enable_oscillation_detection"].asBool();
+        }
         if (root.isMember("use_adam"))
         {
             config.use_adam = root["use_adam"].asBool();
@@ -567,6 +726,32 @@ namespace // anonymous
         {
             config.freeze_p0_non_pose = root["freeze_p0_non_pose"].asBool();
         }
+        if (root.isMember("lambda_update_mask"))
+        {
+            const Json::Value& mask = root["lambda_update_mask"];
+            if (!mask.isArray() || (mask.size() != kThetaSize && mask.size() != kQ4Offset))
+            {
+                throw std::runtime_error("lambda_update_mask must contain 42 entries, or 36 legacy entries (Q4 frozen).");
+            }
+            std::vector<int> update_mask(kThetaSize);
+            for (unsigned int index = 0; index < mask.size(); ++index)
+            {
+                const Json::Value& entry = mask[index];
+                if (entry.isBool())
+                {
+                    update_mask[index] = entry.asBool() ? 1 : 0;
+                }
+                else if (entry.isInt() && (entry.asInt() == 0 || entry.asInt() == 1))
+                {
+                    update_mask[index] = entry.asInt();
+                }
+                else
+                {
+                    throw std::runtime_error("lambda_update_mask entries must be 0/1 or false/true.");
+                }
+            }
+            config.lambda_update_mask = std::move(update_mask);
+        }
         if (root.isMember("use_joint_validation_objective"))
         {
             config.use_joint_validation_objective = root["use_joint_validation_objective"].asBool();
@@ -615,8 +800,10 @@ namespace // anonymous
             Eigen::VectorXd out(expected_size);
             for (int i = 0; i < expected_size; ++i)
             {
+                if (!values[i].isNumeric())
+                    throw std::runtime_error(std::string("Initial theta weight '") + name + "' must be numeric.");
                 const double value = values[i].asDouble();
-                if (!(value > 0.0))
+                if (!std::isfinite(value) || !(value > 0.0))
                 {
                     throw std::runtime_error(std::string("Initial theta weight '") + name + "' must be strictly positive.");
                 }
@@ -630,13 +817,85 @@ namespace // anonymous
         theta.segment<6>(kQ1Offset) = readWeights("Q1", 6);
         theta.segment<6>(kQ2Offset) = readWeights("Q2", 6);
         theta.segment<6>(kQ3Offset) = readWeights("Q3", 6);
+        theta.segment<6>(kQ4Offset) = weights.isMember("Q4")
+            ? readWeights("Q4", 6) : readWeights("Q3", 6);
+        const Json::Value factor = weights.get("prior_factor", 1.0);
+        if (!factor.isNumeric() || !std::isfinite(factor.asDouble()) || factor.asDouble() <= 0.0)
+            throw std::runtime_error("prior_factor must be finite and strictly positive.");
+        theta *= factor.asDouble();
+        if (!theta.allFinite() || theta.minCoeff() <= 0.0)
+            throw std::runtime_error("Scaled initial variances must be finite and strictly positive.");
+        return theta;
+    }
+
+    Eigen::VectorXd loadSavedTheta(const std::filesystem::path &path)
+    {
+        const Json::Value saved = loadJsonFile(path);
+        const Json::Value &values = saved["theta"];
+        if (!values.isArray() || (values.size() != kThetaSize && values.size() != kQ4Offset))
+            throw std::runtime_error("Saved theta must contain 42 entries, or 36 legacy entries with recorded Q4.");
+        const int expected_version = values.size() == kThetaSize ? 2 : 1;
+        if (saved.isMember("parameter_layout_version") &&
+            (!saved["parameter_layout_version"].isInt() || saved["parameter_layout_version"].asInt() != expected_version))
+            throw std::runtime_error("Saved parameter layout version does not match its theta array.");
+        if (expected_version == 2 && saved.isMember("parameter_layout") &&
+            saved["parameter_layout"].asString() != "P0(18),Q1(6),Q2(6),Q3(6),Q4(6)")
+            throw std::runtime_error("Unsupported saved parameter layout.");
+        Eigen::VectorXd theta(kThetaSize);
+        for (unsigned int index = 0; index < values.size(); ++index)
+        {
+            if (!values[index].isNumeric())
+                throw std::runtime_error("Saved theta entries must be numeric.");
+            theta(index) = values[index].asDouble();
+        }
+        if (values.size() == kQ4Offset)
+        {
+            if (saved.isMember("fixed_Q4"))
+            {
+                const Json::Value &Q4 = saved["fixed_Q4"];
+                if (!Q4.isArray() || Q4.size() != 6)
+                    throw std::runtime_error("Recorded fixed_Q4 must contain six effective variances.");
+                for (unsigned int index = 0; index < 6; ++index)
+                {
+                    if (!Q4[index].isNumeric())
+                        throw std::runtime_error("Recorded fixed_Q4 entries must be numeric.");
+                    theta(kQ4Offset + index) = Q4[index].asDouble();
+                }
+            }
+            else
+            {
+                Json::Value robot;
+                const auto robot_path = path.parent_path() / "robot_converged.json";
+                const auto experiment_path = path.parent_path() / "experiment.json";
+                if (std::filesystem::exists(experiment_path))
+                    robot = loadJsonFile(experiment_path)["robot_config"];
+                if (!robot["weights"].isMember("Q4") && std::filesystem::exists(robot_path))
+                    robot = loadJsonFile(robot_path);
+                if (!robot["weights"].isMember("Q4"))
+                    throw std::runtime_error("Legacy theta requires recorded fixed_Q4 or a companion robot/experiment config containing Q4; current config is not used.");
+                theta.tail<6>() = loadInitialThetaFromRobotConfig(robot).tail<6>();
+            }
+        }
+        if (!theta.allFinite() || theta.minCoeff() <= 0.0)
+            throw std::runtime_error("Saved theta entries must be finite and strictly positive.");
         return theta;
     }
 
     void loadRobotTopologyFromJson(const Json::Value &root, Spacetime::RobotTopology &topology)
     {
         topology.N = root["topology"].isMember("N") ? root["topology"]["N"].asUInt() : 1;
-        topology.K = root["topology"].isMember("K_per_second") ? root["topology"]["K_per_second"].asUInt() : 1;
+        if (root["topology"].isMember("K_per_second"))
+        {
+            topology.K = root["topology"]["K_per_second"].asUInt();
+        }
+        else if (root["topology"].isMember("K"))
+        {
+            topology.K = root["topology"]["K"].asUInt();
+        }
+        else
+        {
+            throw std::runtime_error("Robot topology must define either K or K_per_second.");
+        }
         topology.Ms = root["topology"].isMember("Ms") ? root["topology"]["Ms"].asUInt() : 1;
         topology.Mt = root["topology"].isMember("Mt") ? root["topology"]["Mt"].asUInt() : 1;
         topology.L = root["topology"].isMember("length") ? root["topology"]["length"].asDouble() : 0.0;
@@ -708,7 +967,7 @@ namespace // anonymous
         }
         if (variance.size() != kThetaSize)
         {
-            throw std::runtime_error("Variance must contain exactly 36 diagonal parameters for P0, Q1, Q2, and Q3.");
+            throw std::runtime_error("Variance must contain exactly 42 diagonal parameters for P0, Q1, Q2, Q3, and Q4.");
         }
         if (offset + diagonal_size > variance.size())
         {
@@ -719,7 +978,7 @@ namespace // anonymous
         for (int i = 0; i < diagonal_size; ++i)
         {
             const double value = variance(offset + i);
-            if (!(value > 0.0))
+            if (!std::isfinite(value) || !(value > 0.0))
             {
                 throw std::runtime_error(std::string(name) + " must be strictly positive on the diagonal.");
             }
@@ -734,6 +993,7 @@ namespace // anonymous
         fillDiagonalFromVariance(hyperparameters.Q1, variance, kQ1Offset, "Q1");
         fillDiagonalFromVariance(hyperparameters.Q2, variance, kQ2Offset, "Q2");
         fillDiagonalFromVariance(hyperparameters.Q3, variance, kQ3Offset, "Q3");
+        fillDiagonalFromVariance(hyperparameters.Q4, variance, kQ4Offset, "Q4");
         return hyperparameters;
     }
 
@@ -886,11 +1146,11 @@ namespace // anonymous
         contrib.dL_dtheta_state = Eigen::VectorXd::Zero(12);
         contrib.dL_dtheta_info = Eigen::VectorXd::Zero(12);
 
-        contrib.dL_dtheta_state.segment<6>(0) =
+        contrib.dL_dtheta_state.segment<6>(0) = -(
             (dt3 * (u1.array() * v1.array())).matrix() +
             (dt2 * ((u1.array() * v3.array()).matrix() + (u3.array() * v1.array()).matrix())) +
-            (dt * (u3.array() * v3.array()).matrix());
-        contrib.dL_dtheta_state.segment<6>(6) = dt * (u2.array() * v2.array()).matrix();
+            (dt * (u3.array() * v3.array()).matrix()));
+        contrib.dL_dtheta_state.segment<6>(6) = -dt * (u2.array() * v2.array()).matrix();
 
         contrib.dL_dtheta_info.segment<6>(0) = info_scale *
             ((dt3 * (w1.array().square()).matrix()) +
@@ -937,31 +1197,20 @@ namespace // anonymous
         const Eigen::VectorXd w2 = blockSegment(w, 1, 6);
         const Eigen::VectorXd w3 = blockSegment(w, 2, 6);
 
-        const Eigen::Matrix<double, 6, 6> varpihat_t = se3::curlyhat(local_nodes[0].varpi).template cast<double>().transpose();
-        const Eigen::VectorXd a = varpihat_t * u3;
-        const Eigen::VectorXd b = varpihat_t * v3;
-        const Eigen::VectorXd c = varpihat_t * w3;
-
         spacetime::FactorGradientContrib contrib;
         contrib.dL_dtheta_state = Eigen::VectorXd::Zero(12);
         contrib.dL_dtheta_info = Eigen::VectorXd::Zero(12);
 
-        contrib.dL_dtheta_state.segment<6>(0) =
+        contrib.dL_dtheta_state.segment<6>(0) = -(
             (ds3 * (u1.array() * v1.array())).matrix() +
             (ds2 * ((u1.array() * v2.array()).matrix() + (u2.array() * v1.array()).matrix())) +
-            (ds * (u2.array() * v2.array()).matrix()) -
-            (ds3 * ((v1.array() * a.array()).matrix() + (u1.array() * b.array()).matrix())) -
-            (ds2 * ((v2.array() * a.array()).matrix() + (u2.array() * b.array()).matrix())) +
-            (ds3 * (a.array() * b.array()).matrix());
-        contrib.dL_dtheta_state.segment<6>(6) = ds * (u3.array() * v3.array()).matrix();
+            (ds * (u2.array() * v2.array())).matrix());
+        contrib.dL_dtheta_state.segment<6>(6) = -ds * (u3.array() * v3.array()).matrix();
 
         contrib.dL_dtheta_info.segment<6>(0) = info_scale *
             ((ds3 * (w1.array().square()).matrix()) +
              (2.0 * ds2 * (w1.array() * w2.array()).matrix()) +
-             (ds * (w2.array().square()).matrix()) -
-             (2.0 * ds3 * (w1.array() * c.array()).matrix()) -
-             (2.0 * ds2 * (w2.array() * c.array()).matrix()) +
-             (ds3 * (c.array().square()).matrix()));
+             (ds * (w2.array().square()).matrix()));
         contrib.dL_dtheta_info.segment<6>(6) = info_scale * (ds * (w3.array().square()).matrix());
 
         return contrib;
@@ -1161,13 +1410,33 @@ namespace // anonymous
         return -eigenvalues.log().sum();
     }
 
+    double temporalBridgeKernel(const TemporalValidationData& first, const TemporalValidationData& second)
+    {
+        if (first.support.size() != 2 || first.support != second.support)
+        {
+            return 0.0;
+        }
+        const double alpha = std::min(first.offset, second.offset) / first.duration;
+        const double beta = std::max(first.offset, second.offset) / first.duration;
+        return std::pow(first.duration, 3) * alpha * alpha * (1.0 - beta) * (1.0 - beta) *
+               (3.0 * beta - alpha * (1.0 + 2.0 * beta)) / 6.0;
+    }
+
     JointValidationCacheData buildJointValidationCache(
         const Eigen::SparseMatrix<double>& H,
         const std::vector<spacetime::ValidationTarget>& validation_targets,
         const std::vector<Spacetime::SystemState<DTYPE>::Node>& solved_nodes,
-        const Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>>& h_solver)
+        const Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>>& h_solver,
+        const Eigen::VectorXd* theta = nullptr,
+        bool joint_observations = true)
     {
         JointValidationCacheData cache;
+        cache.joint_observations = joint_observations;
+        if (theta)
+        {
+            cache.temporal_q1 = theta->segment<6>(kQ1Offset).asDiagonal();
+        }
+        const auto setup_start = std::chrono::steady_clock::now();
         if (validation_targets.empty() || solved_nodes.empty())
         {
             return cache;
@@ -1176,11 +1445,12 @@ namespace // anonymous
         constexpr int node_dim = 18;
         const int validation_count = static_cast<int>(validation_targets.size());
         const int joint_dim = validation_count * node_dim;
+        cache.full_state_observation = joint_observations && validation_count == static_cast<int>(solved_nodes.size()) &&
+                           joint_dim == H.rows();
         cache.node_indices.reserve(validation_targets.size());
         cache.observed_masks.reserve(validation_targets.size());
         cache.node_errors_stacked = Eigen::VectorXd::Zero(joint_dim);
 
-        Eigen::MatrixXd rhs_selector = Eigen::MatrixXd::Zero(H.rows(), joint_dim);
         for (int i = 0; i < validation_count; ++i)
         {
             const auto& target = validation_targets[static_cast<size_t>(i)];
@@ -1192,70 +1462,215 @@ namespace // anonymous
             cache.node_indices.push_back(target.node_index);
             cache.observed_masks.push_back(target.observed_mask);
 
-            const auto& estimate = solved_nodes[static_cast<size_t>(target.node_index)];
-            const Vector18d e_full = computeNodeValidationError(estimate, target.ground_truth);
+            cache.temporal_targets.push_back(interpolateValidationTime(target, solved_nodes));
+            if (cache.temporal_targets.back().support.size() == 2 && !theta)
+            {
+                throw std::runtime_error("Temporal validation covariance requires process variances.");
+            }
+            const Vector18d e_full = computeNodeValidationError(cache.temporal_targets.back().estimate, target.ground_truth);
             const Vector18d e_masked = applyObservedMask(e_full, target.observed_mask);
             cache.node_errors_stacked.segment<18>(i * node_dim) = e_masked;
 
             const int observed_dims = countObservedDimensions(target.observed_mask);
+            cache.full_state_observation = cache.full_state_observation &&
+                                           target.node_index == i &&
+                                           observed_dims == node_dim;
             if (observed_dims > 0)
             {
                 ++cache.effective_validation_count;
                 cache.observed_dim_total += observed_dims;
             }
-
-            rhs_selector.block(target.node_index * node_dim, i * node_dim, node_dim, node_dim).setIdentity();
         }
 
+        if (cache.full_state_observation)
+        {
+            const Eigen::VectorXd diagonal = h_solver.vectorD();
+            if (diagonal.size() != H.rows() || (diagonal.array() <= 0.0).any())
+            {
+                throw std::runtime_error("buildJointValidationCache: H must be positive definite for full-state log-det evaluation.");
+            }
+            cache.logdet_sum = -diagonal.array().log().sum();
+            cache.setup_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - setup_start).count();
+            return cache;
+        }
+
+        for (int i = 0; i < validation_count; ++i)
+        {
+            const auto& mask = cache.observed_masks[static_cast<std::size_t>(i)];
+            for (int d = 0; d < node_dim; ++d)
+            {
+                if (mask(d) != 0)
+                {
+                    cache.observed_stacked_indices.push_back(i * node_dim + d);
+                }
+            }
+        }
+
+        const int observed_dim = static_cast<int>(cache.observed_stacked_indices.size());
+        const auto selector_start = std::chrono::steady_clock::now();
+        cache.setup_ms = std::chrono::duration<double, std::milli>(selector_start - setup_start).count();
+        std::vector<Eigen::Triplet<double>> projection_entries;
+        cache.observed_columns.resize(validation_targets.size());
+        for (auto& columns : cache.observed_columns)
+        {
+            columns.fill(-1);
+        }
+        for (int column = 0; column < observed_dim; ++column)
+        {
+            const int stacked_index = cache.observed_stacked_indices[static_cast<std::size_t>(column)];
+            const int target_index = stacked_index / node_dim;
+            const int dimension = stacked_index % node_dim;
+            cache.observed_columns[target_index][dimension] = column;
+            const auto& temporal = cache.temporal_targets[target_index];
+            if (validation_targets[target_index].interpolate_time && dimension < 6)
+            {
+                for (int support = 0; support < static_cast<int>(temporal.support.size()); ++support)
+                {
+                    for (int local = 0; local < node_dim; ++local)
+                    {
+                        const double value = temporal.pose_jacobian(dimension, support * node_dim + local);
+                        if (value != 0.0)
+                        {
+                            projection_entries.emplace_back(column, temporal.support[support] * node_dim + local, value);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                projection_entries.emplace_back(column, cache.node_indices[target_index] * node_dim + dimension, 1.0);
+            }
+        }
+        cache.observation_projection.resize(observed_dim, H.rows());
+        cache.observation_projection.setFromTriplets(projection_entries.begin(), projection_entries.end());
+        const Eigen::MatrixXd rhs_selector = Eigen::MatrixXd(cache.observation_projection.transpose());
+        const auto projection_solve_start = std::chrono::steady_clock::now();
+        cache.selector_ms = std::chrono::duration<double, std::milli>(
+            projection_solve_start - selector_start).count();
         cache.h_inv_selector = h_solver.solve(rhs_selector);
         if (h_solver.info() != Eigen::Success)
         {
             throw std::runtime_error("buildJointValidationCache: failed to solve for H^{-1}E_V projection.");
         }
 
-        cache.joint_covariance = Eigen::MatrixXd::Zero(joint_dim, joint_dim);
-        for (int i = 0; i < validation_count; ++i)
+        const auto covariance_start = std::chrono::steady_clock::now();
+        cache.projection_solve_ms = std::chrono::duration<double, std::milli>(
+            covariance_start - projection_solve_start).count();
+        if (!joint_observations)
         {
-            const int node_index_i = cache.node_indices[static_cast<size_t>(i)];
-            for (int j = 0; j < validation_count; ++j)
+            cache.weighted_errors = Eigen::VectorXd::Zero(joint_dim);
+            cache.weighted_projection = Eigen::MatrixXd::Zero(H.rows(), observed_dim);
+            int offset = 0;
+            bool have_spectrum = false;
+            for (int target_index = 0; target_index < validation_count; ++target_index)
             {
-                cache.joint_covariance.block(i * node_dim, j * node_dim, node_dim, node_dim) =
-                    cache.h_inv_selector.block(node_index_i * node_dim, j * node_dim, node_dim, node_dim);
+                const int dimensions = countObservedDimensions(cache.observed_masks[target_index]);
+                cache.marginal_offsets.push_back(offset);
+                cache.marginal_information.emplace_back(dimensions, dimensions);
+                if (dimensions == 0) continue;
+                const auto block_start = std::chrono::steady_clock::now();
+                Eigen::MatrixXd covariance = cache.observation_projection.middleRows(offset, dimensions) *
+                    cache.h_inv_selector.middleCols(offset, dimensions);
+                const auto& temporal = cache.temporal_targets[target_index];
+                const Eigen::Matrix<double, 6, 6> bridge = temporalBridgeKernel(temporal, temporal) *
+                    temporal.bridge_map * cache.temporal_q1 * temporal.bridge_map.transpose();
+                for (int row = 0; row < 6; ++row)
+                {
+                    const int observed_row = cache.observed_columns[target_index][row];
+                    if (observed_row < 0) continue;
+                    for (int column = 0; column < 6; ++column)
+                    {
+                        const int observed_column = cache.observed_columns[target_index][column];
+                        if (observed_column >= 0)
+                            covariance(observed_row - offset, observed_column - offset) += bridge(row, column);
+                    }
+                }
+                covariance = (0.5 * (covariance + covariance.transpose())).eval();
+                const auto eigen_start = std::chrono::steady_clock::now();
+                cache.covariance_ms += std::chrono::duration<double, std::milli>(eigen_start - block_start).count();
+                Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eigensolver(covariance);
+                if (eigensolver.info() != Eigen::Success)
+                    throw std::runtime_error("buildJointValidationCache: failed to eigendecompose marginal covariance.");
+                const auto information_start = std::chrono::steady_clock::now();
+                cache.eigendecomposition_ms += std::chrono::duration<double, std::milli>(information_start - eigen_start).count();
+                const double minimum = eigensolver.eigenvalues().minCoeff();
+                const double maximum = eigensolver.eigenvalues().maxCoeff();
+                cache.min_observed_cov_eig = have_spectrum ? std::min(cache.min_observed_cov_eig, minimum) : minimum;
+                cache.max_observed_cov_eig = have_spectrum ? std::max(cache.max_observed_cov_eig, maximum) : maximum;
+                have_spectrum = true;
+                cache.logdet_sum += eigensolver.eigenvalues().array().max(1e-22).log().sum();
+                auto& information = cache.marginal_information.back();
+                information = eigensolver.eigenvectors() *
+                    eigensolver.eigenvalues().array().max(1e-20).inverse().matrix().asDiagonal() *
+                    eigensolver.eigenvectors().transpose();
+                if (!information.allFinite())
+                    throw std::runtime_error("buildJointValidationCache: non-finite marginal information.");
+                cache.weighted_projection.middleCols(offset, dimensions).noalias() =
+                    cache.h_inv_selector.middleCols(offset, dimensions) * information;
+                cache.information_ms += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - information_start).count();
+                offset += dimensions;
+            }
+            if (have_spectrum)
+                cache.observed_cov_condition = cache.max_observed_cov_eig / std::max(cache.min_observed_cov_eig, 1e-22);
+            return cache;
+        }
+        cache.joint_covariance = cache.observation_projection * cache.h_inv_selector;
+        for (int first = 0; first < validation_count; ++first)
+        {
+            for (int second = 0; second < validation_count; ++second)
+            {
+                const double kernel = temporalBridgeKernel(cache.temporal_targets[first], cache.temporal_targets[second]);
+                const Eigen::Matrix<double, 6, 6> bridge = kernel * cache.temporal_targets[first].bridge_map *
+                    cache.temporal_q1 * cache.temporal_targets[second].bridge_map.transpose();
+                for (int row = 0; row < node_dim; ++row)
+                {
+                    const int observed_row = cache.observed_columns[first][row];
+                    if (observed_row < 0) continue;
+                    for (int column = 0; column < node_dim; ++column)
+                    {
+                        const int observed_column = cache.observed_columns[second][column];
+                        if (observed_column < 0) continue;
+                        if (!joint_observations && first != second)
+                        {
+                            cache.joint_covariance(observed_row, observed_column) = 0.0;
+                        }
+                        else if (row < 6 && column < 6)
+                        {
+                            cache.joint_covariance(observed_row, observed_column) += bridge(row, column);
+                        }
+                    }
+                }
             }
         }
         cache.joint_covariance = 0.5 * (cache.joint_covariance + cache.joint_covariance.transpose());
 
-        std::vector<int> observed_indices;
-        observed_indices.reserve(joint_dim);
-        for (int i = 0; i < validation_count; ++i)
-        {
-            const auto& mask = cache.observed_masks[static_cast<size_t>(i)];
-            for (int d = 0; d < node_dim; ++d)
-            {
-                if (mask(d) != 0)
-                {
-                    observed_indices.push_back(i * node_dim + d);
-                }
-            }
-        }
-
-        cache.joint_information = Eigen::MatrixXd::Zero(joint_dim, joint_dim);
+        cache.joint_information = Eigen::MatrixXd::Zero(observed_dim, observed_dim);
         cache.weighted_errors = Eigen::VectorXd::Zero(joint_dim);
-        if (observed_indices.empty())
+        if (observed_dim == 0)
         {
+            cache.covariance_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - covariance_start).count();
             return cache;
         }
 
         constexpr double kCovFloor = 1e-20;
         constexpr double kLogDetFloor = 1e-22;
-        Eigen::MatrixXd joint_cov_observed = extractPrincipalSubmatrixDynamic(cache.joint_covariance, observed_indices);
+        Eigen::MatrixXd joint_cov_observed = cache.joint_covariance;
         joint_cov_observed = 0.5 * (joint_cov_observed + joint_cov_observed.transpose());
 
+        const auto eigendecomposition_start = std::chrono::steady_clock::now();
+        cache.covariance_ms = std::chrono::duration<double, std::milli>(
+            eigendecomposition_start - covariance_start).count();
         Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eigensolver(joint_cov_observed);
         if (eigensolver.info() != Eigen::Success)
         {
             throw std::runtime_error("buildJointValidationCache: failed to eigendecompose joint observed covariance.");
         }
+        const auto information_start = std::chrono::steady_clock::now();
+        cache.eigendecomposition_ms = std::chrono::duration<double, std::milli>(
+            information_start - eigendecomposition_start).count();
         if (eigensolver.eigenvalues().size() > 0)
         {
             cache.min_observed_cov_eig = eigensolver.eigenvalues().minCoeff();
@@ -1266,34 +1681,235 @@ namespace // anonymous
         const Eigen::VectorXd evals_for_logdet = eigensolver.eigenvalues().array().max(kLogDetFloor);
         cache.logdet_sum = evals_for_logdet.array().log().sum();
 
-        Eigen::VectorXd evals_for_inv = eigensolver.eigenvalues().array().max(kCovFloor);
-        joint_cov_observed = eigensolver.eigenvectors() * evals_for_inv.asDiagonal() * eigensolver.eigenvectors().transpose();
-
-        const Eigen::MatrixXd rhs_identity = Eigen::MatrixXd::Identity(static_cast<int>(observed_indices.size()), static_cast<int>(observed_indices.size()));
-        Eigen::LLT<Eigen::MatrixXd> llt(joint_cov_observed);
-        if (llt.info() != Eigen::Success)
+        const Eigen::VectorXd inverse_eigenvalues =
+            eigensolver.eigenvalues().array().max(kCovFloor).inverse();
+        cache.joint_information = eigensolver.eigenvectors() * inverse_eigenvalues.asDiagonal() *
+                                  eigensolver.eigenvectors().transpose();
+        if (!cache.joint_information.allFinite())
         {
-            throw std::runtime_error("buildJointValidationCache: failed LLT factorization for joint observed covariance.");
+            throw std::runtime_error("buildJointValidationCache: non-finite joint observed information.");
         }
-        const Eigen::MatrixXd joint_info_observed = llt.solve(rhs_identity);
+        cache.weighted_projection = cache.h_inv_selector * cache.joint_information;
+        cache.information_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - information_start).count();
+        return cache;
+    }
 
-        for (int r = 0; r < static_cast<int>(observed_indices.size()); ++r)
+    void accumulateTemporalCovarianceGradients(
+        const std::vector<spacetime::ValidationTarget>& targets,
+        const std::vector<Spacetime::SystemState<DTYPE>::Node>& nodes,
+        const JointValidationCacheData& cache,
+        JointValidationGroupData& group)
+    {
+        if (cache.full_state_observation ||
+            std::none_of(cache.temporal_targets.begin(), cache.temporal_targets.end(), [](const TemporalValidationData& temporal) {
+                return temporal.support.size() == 2;
+            }))
         {
-            for (int c = 0; c < static_cast<int>(observed_indices.size()); ++c)
+            return;
+        }
+
+        Eigen::VectorXd weighted(cache.observed_stacked_indices.size());
+        for (int index = 0; index < weighted.size(); ++index)
+        {
+            weighted(index) = group.weighted_errors(cache.observed_stacked_indices[index]);
+        }
+        Eigen::MatrixXd covariance_sensitivity;
+        Eigen::MatrixXd projection_sensitivity;
+        std::vector<Eigen::MatrixXd> marginal_sensitivities;
+        if (cache.joint_observations)
+        {
+            covariance_sensitivity = 0.5 * (cache.joint_information - weighted * weighted.transpose());
+            projection_sensitivity = 2.0 * covariance_sensitivity * cache.h_inv_selector.transpose();
+        }
+        else
+        {
+            for (int target_index = 0; target_index < static_cast<int>(targets.size()); ++target_index)
             {
-                cache.joint_information(observed_indices[static_cast<std::size_t>(r)], observed_indices[static_cast<std::size_t>(c)]) =
-                    joint_info_observed(r, c);
+                const int offset = cache.marginal_offsets[target_index];
+                const auto& information = cache.marginal_information[target_index];
+                const int dimensions = information.rows();
+                const Eigen::VectorXd local_weight = weighted.segment(offset, dimensions);
+                marginal_sensitivities.push_back(0.5 * (information - local_weight * local_weight.transpose()));
             }
         }
+        group.covariance_state_gradient = Eigen::VectorXd::Zero(cache.observation_projection.cols());
 
-        cache.weighted_errors = cache.joint_information * cache.node_errors_stacked;
-        cache.mahalanobis_sum = cache.node_errors_stacked.dot(cache.weighted_errors);
-        return cache;
+        for (int first = 0; first < static_cast<int>(targets.size()); ++first)
+        {
+            const auto& temporal = cache.temporal_targets[first];
+            if (temporal.support.size() != 2) continue;
+            Eigen::Matrix<double, 6, 36> local_projection_sensitivity = Eigen::Matrix<double, 6, 36>::Zero();
+            for (int support = 0; support < 2; ++support)
+            {
+                Eigen::MatrixXd marginal_projection;
+                if (!cache.joint_observations)
+                {
+                    marginal_projection = 2.0 * marginal_sensitivities[first] * cache.h_inv_selector.block(
+                        temporal.support[support] * 18, cache.marginal_offsets[first],
+                        18, cache.marginal_information[first].rows()).transpose();
+                }
+                for (int dimension = 0; dimension < 6; ++dimension)
+                {
+                    const int observed = cache.observed_columns[first][dimension];
+                    if (observed < 0) continue;
+                    if (cache.joint_observations)
+                        local_projection_sensitivity.block<1, 18>(dimension, support * 18) =
+                            projection_sensitivity.block<1, 18>(observed, temporal.support[support] * 18);
+                    else
+                        local_projection_sensitivity.block<1, 18>(dimension, support * 18) =
+                            marginal_projection.row(observed - cache.marginal_offsets[first]);
+                }
+            }
+
+            Eigen::Matrix<double, 6, 6> bridge_map_sensitivity = Eigen::Matrix<double, 6, 6>::Zero();
+            const int second_begin = cache.joint_observations ? 0 : first;
+            const int second_end = cache.joint_observations ? static_cast<int>(targets.size()) : first + 1;
+            for (int second = second_begin; second < second_end; ++second)
+            {
+                const double kernel = temporalBridgeKernel(temporal, cache.temporal_targets[second]);
+                if (kernel == 0.0) continue;
+                Eigen::Matrix<double, 6, 6> sensitivity = Eigen::Matrix<double, 6, 6>::Zero();
+                for (int row = 0; row < 6; ++row)
+                {
+                    const int observed_row = cache.observed_columns[first][row];
+                    if (observed_row < 0) continue;
+                    for (int column = 0; column < 6; ++column)
+                    {
+                        const int observed_column = cache.observed_columns[second][column];
+                        if (observed_column >= 0)
+                        {
+                            sensitivity(row, column) = cache.joint_observations
+                                ? covariance_sensitivity(observed_row, observed_column)
+                                : marginal_sensitivities[first](observed_row - cache.marginal_offsets[first],
+                                                               observed_column - cache.marginal_offsets[first]);
+                        }
+                    }
+                }
+                const auto& second_map = cache.temporal_targets[second].bridge_map;
+                bridge_map_sensitivity += 2.0 * kernel * sensitivity * second_map * cache.temporal_q1;
+                for (int dimension = 0; dimension < 6; ++dimension)
+                {
+                    group.covariance_theta_gradient(kQ1Offset + dimension) +=
+                        kernel * temporal.bridge_map.col(dimension).dot(sensitivity * second_map.col(dimension));
+                }
+            }
+
+            std::vector<Spacetime::SystemState<DTYPE>::Node> endpoints = {
+                nodes[temporal.support[0]], nodes[temporal.support[1]]};
+            auto local_target = targets[first];
+            local_target.node_index = 0;
+            const double step = 2e-4;
+            for (int support = 0; support < 2; ++support)
+            {
+                for (int dimension = 0; dimension < 18; ++dimension)
+                {
+                    if (dimension >= 6 && dimension < 12) continue;
+                    auto plus = endpoints;
+                    auto minus = endpoints;
+                    Eigen::Vector<DTYPE, 18> perturbation = Eigen::Vector<DTYPE, 18>::Zero();
+                    perturbation(dimension) = step;
+                    Spacetime::perturbNode(endpoints[support], perturbation, plus[support]);
+                    perturbation *= -1.0;
+                    Spacetime::perturbNode(endpoints[support], perturbation, minus[support]);
+                    const auto plus_projection = interpolateValidationTime(local_target, plus);
+                    const auto minus_projection = interpolateValidationTime(local_target, minus);
+                    const double derivative =
+                        (local_projection_sensitivity.cwiseProduct(plus_projection.pose_jacobian - minus_projection.pose_jacobian).sum() +
+                         bridge_map_sensitivity.cwiseProduct(plus_projection.bridge_map - minus_projection.bridge_map).sum()) / (2.0 * step);
+                    group.covariance_state_gradient(temporal.support[support] * 18 + dimension) += derivative;
+                }
+            }
+        }
+    }
+
+    JointValidationGroupData buildJointValidationGroupData(
+        const Eigen::SparseMatrix<double>& H,
+        const std::vector<spacetime::ValidationTarget>& validation_targets,
+        const std::vector<Spacetime::SystemState<DTYPE>::Node>& solved_nodes,
+        const JointValidationCacheData& shared_cache,
+        bool compute_sensitivities = true)
+    {
+        constexpr int node_dim = 18;
+        if (validation_targets.size() != shared_cache.node_indices.size() ||
+            validation_targets.size() != shared_cache.observed_masks.size())
+        {
+            throw std::runtime_error("Joint validation groups must have identical sizes.");
+        }
+
+        JointValidationGroupData group;
+        group.node_errors_stacked = Eigen::VectorXd::Zero(static_cast<int>(validation_targets.size()) * node_dim);
+        for (int i = 0; i < static_cast<int>(validation_targets.size()); ++i)
+        {
+            const auto& target = validation_targets[static_cast<std::size_t>(i)];
+            if (target.node_index != shared_cache.node_indices[static_cast<std::size_t>(i)] ||
+                target.observed_mask != shared_cache.observed_masks[static_cast<std::size_t>(i)])
+            {
+                throw std::runtime_error("Joint validation groups must use identical node ordering and observed masks.");
+            }
+            if (target.node_index < 0 || target.node_index >= static_cast<int>(solved_nodes.size()))
+            {
+                throw std::runtime_error("Joint validation target node index out of range.");
+            }
+
+            if (target.interpolate_time &&
+                std::abs(target.ground_truth.time - shared_cache.temporal_targets[i].estimate.time) > 1e-10)
+            {
+                throw std::runtime_error("Joint validation groups must use identical timestamps.");
+            }
+            const Vector18d error = computeNodeValidationError(
+                shared_cache.temporal_targets[i].estimate, target.ground_truth);
+            group.node_errors_stacked.segment<18>(i * node_dim) = applyObservedMask(error, target.observed_mask);
+        }
+
+        if (shared_cache.full_state_observation)
+        {
+            group.weighted_errors = H * group.node_errors_stacked;
+        }
+        else
+        {
+            Eigen::VectorXd observed_errors(shared_cache.observed_stacked_indices.size());
+            for (int i = 0; i < observed_errors.size(); ++i)
+            {
+                observed_errors(i) = group.node_errors_stacked(
+                    shared_cache.observed_stacked_indices[static_cast<std::size_t>(i)]);
+            }
+            Eigen::VectorXd observed_weighted_errors;
+            if (shared_cache.joint_observations)
+            {
+                observed_weighted_errors = shared_cache.joint_information * observed_errors;
+            }
+            else
+            {
+                observed_weighted_errors = Eigen::VectorXd::Zero(observed_errors.size());
+                for (int target_index = 0; target_index < static_cast<int>(validation_targets.size()); ++target_index)
+                {
+                    const int offset = shared_cache.marginal_offsets[target_index];
+                    const auto& information = shared_cache.marginal_information[target_index];
+                    const int dimensions = information.rows();
+                    observed_weighted_errors.segment(offset, dimensions).noalias() =
+                        information * observed_errors.segment(offset, dimensions);
+                }
+            }
+            group.weighted_errors = Eigen::VectorXd::Zero(group.node_errors_stacked.size());
+            for (int i = 0; i < observed_weighted_errors.size(); ++i)
+            {
+                group.weighted_errors(
+                    shared_cache.observed_stacked_indices[static_cast<std::size_t>(i)]) = observed_weighted_errors(i);
+            }
+        }
+        group.mahalanobis_sum = group.node_errors_stacked.dot(group.weighted_errors);
+        if (compute_sensitivities)
+        {
+            accumulateTemporalCovarianceGradients(validation_targets, solved_nodes, shared_cache, group);
+        }
+        return group;
     }
 
     spacetime::ValidationLossData computeValidationLossWithJoint(
         const std::vector<spacetime::ValidationTarget>& validation_targets,
-        const JointValidationCacheData& cache)
+        const JointValidationCacheData& cache,
+        const JointValidationGroupData& group)
     {
         spacetime::ValidationLossData out;
         if (validation_targets.empty())
@@ -1302,8 +1918,16 @@ namespace // anonymous
         }
 
         out.nees_per_node = Eigen::VectorXd::Zero(static_cast<int>(validation_targets.size()));
-        out.node_errors_stacked = cache.node_errors_stacked;
-        out.mahalanobis_sum = cache.mahalanobis_sum;
+        if (!cache.joint_observations)
+        {
+            for (int index = 0; index < out.nees_per_node.size(); ++index)
+            {
+                out.nees_per_node(index) = group.node_errors_stacked.segment<18>(index * 18).dot(
+                    group.weighted_errors.segment<18>(index * 18));
+            }
+        }
+        out.node_errors_stacked = group.node_errors_stacked;
+        out.mahalanobis_sum = group.mahalanobis_sum;
         out.logdet_sum = cache.logdet_sum;
         const double denom = static_cast<double>(std::max(1, cache.effective_validation_count));
         out.mean_nees = out.mahalanobis_sum / denom;
@@ -1316,7 +1940,8 @@ namespace // anonymous
 
     Eigen::VectorXd computeAdjointRhsWithJoint(const Eigen::SparseMatrix<double>& H,
                                                const std::vector<spacetime::ValidationTarget>& validation_targets,
-                                               const JointValidationCacheData& cache)
+                                               const JointValidationCacheData& cache,
+                                               const JointValidationGroupData& group)
     {
         Eigen::VectorXd rhs = Eigen::VectorXd::Zero(H.rows());
         if (validation_targets.empty())
@@ -1333,28 +1958,58 @@ namespace // anonymous
                 throw std::runtime_error("computeAdjointRhsWithJoint: validation node index out of range.");
             }
 
-            const Vector18d e = cache.node_errors_stacked.segment<18>(i * node_dim);
+            const Vector18d e = group.node_errors_stacked.segment<18>(i * node_dim);
             if (countObservedDimensions(cache.observed_masks[static_cast<size_t>(i)]) == 0)
             {
                 continue;
             }
 
-            const Vector18d weighted_error = cache.weighted_errors.segment<18>(i * node_dim);
+            const Vector18d weighted_error = group.weighted_errors.segment<18>(i * node_dim);
             Matrix18d J = Matrix18d::Identity();
-            J.block<6, 6>(0, 0) = se3::vec2jacinv(e.segment<6>(0));
-            rhs.segment<18>(node_index * node_dim) += J.transpose() * weighted_error;
+            const Eigen::Matrix<double, 6, 1> log_argument =
+                validation_targets[i].interpolate_time ? Eigen::Matrix<double, 6, 1>(-e.head<6>()) : Eigen::Matrix<double, 6, 1>(e.head<6>());
+            J.block<6, 6>(0, 0) = se3::vec2jacinv(log_argument);
+            const Vector18d local_gradient = J.transpose() * weighted_error;
+            if (validation_targets[i].interpolate_time)
+            {
+                const auto& temporal = cache.temporal_targets[i];
+                const Eigen::VectorXd endpoint_gradient = temporal.pose_jacobian.transpose() * local_gradient.head<6>();
+                for (int support = 0; support < static_cast<int>(temporal.support.size()); ++support)
+                {
+                    rhs.segment<18>(temporal.support[support] * node_dim) += endpoint_gradient.segment<18>(support * node_dim);
+                }
+            }
+            else
+            {
+                rhs.segment<18>(node_index * node_dim) += local_gradient;
+            }
+        }
+        if (group.covariance_state_gradient.size() == rhs.size())
+        {
+            rhs -= group.covariance_state_gradient;
         }
         return rhs;
     }
 
     Eigen::VectorXd computeQuadraticRhsWithJoint(const Eigen::SparseMatrix<double>& H,
                                                  const std::vector<spacetime::ValidationTarget>& validation_targets,
-                                                 const JointValidationCacheData& cache)
+                                                 const JointValidationCacheData& cache,
+                                                 const JointValidationGroupData& group)
     {
         Eigen::VectorXd rhs = Eigen::VectorXd::Zero(H.rows());
         if (validation_targets.empty())
         {
             return rhs;
+        }
+
+        if (!cache.full_state_observation)
+        {
+            Eigen::VectorXd observed_weight(cache.observed_stacked_indices.size());
+            for (int index = 0; index < observed_weight.size(); ++index)
+            {
+                observed_weight(index) = group.weighted_errors(cache.observed_stacked_indices[index]);
+            }
+            return cache.observation_projection.transpose() * observed_weight;
         }
 
         constexpr int node_dim = 18;
@@ -1365,7 +2020,7 @@ namespace // anonymous
             {
                 throw std::runtime_error("computeQuadraticRhsWithJoint: validation node index out of range.");
             }
-            rhs.segment<18>(node_index * node_dim) += cache.weighted_errors.segment<18>(i * node_dim);
+            rhs.segment<18>(node_index * node_dim) += group.weighted_errors.segment<18>(i * node_dim);
         }
         return rhs;
     }
@@ -1561,19 +2216,14 @@ namespace // anonymous
         const double ds3 = ds * ds * ds / 3.0;
 
         const Eigen::Matrix<double, 6, 6> Q2 = diagonal6(theta_local.segment<6>(0));
-        const Eigen::Matrix<double, 6, 6> Q3 = diagonal6(theta_local.segment<6>(6));
-        const Eigen::Matrix<double, 6, 6> varpihat = se3::curlyhat(local_nodes[0].varpi).template cast<double>();
+        const Eigen::Matrix<double, 6, 6> Q4 = diagonal6(theta_local.segment<6>(6));
 
         Matrix18d Q = Matrix18d::Zero();
         Q.block<6, 6>(0, 0) = ds3 * Q2;
         Q.block<6, 6>(0, 6) = ds2 * Q2;
-        Q.block<6, 6>(0, 12) = -ds3 * Q2 * varpihat.transpose();
         Q.block<6, 6>(6, 0) = ds2 * Q2;
         Q.block<6, 6>(6, 6) = ds * Q2;
-        Q.block<6, 6>(6, 12) = -ds2 * Q2 * varpihat.transpose();
-        Q.block<6, 6>(12, 0) = -ds3 * varpihat * Q2;
-        Q.block<6, 6>(12, 6) = -ds2 * varpihat * Q2;
-        Q.block<6, 6>(12, 12) = ds * Q3 + ds3 * varpihat * Q2 * varpihat.transpose();
+        Q.block<6, 6>(12, 12) = ds * Q4;
         return Q;
     }
 
@@ -1723,7 +2373,7 @@ namespace // anonymous
             const auto objective = [&](const Eigen::VectorXd& variance_local) {
                 const Matrix18d Q = buildTimeCovariance(time_sample.local_nodes, variance_local);
                 const Matrix18d info = Q.inverse();
-                return -(a.transpose() * info * b)(0, 0) - time_sample.info_scale * (c.transpose() * info * c)(0, 0);
+                return (a.transpose() * info * b)(0, 0) - time_sample.info_scale * (c.transpose() * info * c)(0, 0);
             };
 
             const Eigen::VectorXd numeric = perturb_lambda
@@ -1745,8 +2395,8 @@ namespace // anonymous
             const Eigen::VectorXd analytic = contrib.dL_dtheta_state + contrib.dL_dtheta_info;
 
             Eigen::VectorXd variance_space(12);
-            variance_space.segment<6>(0) = variance.segment<6>(kQ2Offset);
-            variance_space.segment<6>(6) = variance.segment<6>(kQ3Offset);
+            variance_space.head<6>() = variance.segment<6>(kQ2Offset);
+            variance_space.tail<6>() = variance.segment<6>(kQ4Offset);
             const Eigen::VectorXd a = space_sample.E_f * space_sample.adjoint_lambda_f;
             const Eigen::VectorXd b = space_sample.e_f;
             const Eigen::VectorXd c = space_sample.E_f * space_sample.e_nodes;
@@ -1754,7 +2404,7 @@ namespace // anonymous
             const auto objective = [&](const Eigen::VectorXd& variance_local) {
                 const Matrix18d Q = buildSpaceCovariance(space_sample.local_nodes, variance_local);
                 const Matrix18d info = Q.inverse();
-                return -(a.transpose() * info * b)(0, 0) - space_sample.info_scale * (c.transpose() * info * c)(0, 0);
+                return (a.transpose() * info * b)(0, 0) - space_sample.info_scale * (c.transpose() * info * c)(0, 0);
             };
 
             const Eigen::VectorXd numeric = perturb_lambda
@@ -1774,8 +2424,74 @@ namespace // anonymous
         return e;
     }
 
+    spacetime::PoseValidationMetrics computePoseValidationMetrics(
+        const Spacetime::Estimator& estimator,
+        const Spacetime::SystemState<DTYPE>& state,
+        const std::vector<spacetime::ValidationTarget>& targets,
+        const Spacetime::RobotTopology& topology,
+        bool tip_only)
+    {
+        spacetime::PoseValidationMetrics metrics;
+        double translation_squared_sum = 0.0;
+        double rotation_squared_sum = 0.0;
+        for (const auto& target : targets)
+        {
+            const double arclength = target.ground_truth.arclength;
+            const bool at_tip = std::abs(arclength - topology.L) <= TOLERANCE;
+            const bool in_body = arclength > TOLERANCE && arclength < topology.L - TOLERANCE;
+            if ((tip_only && !at_tip) || (!tip_only && !in_body))
+            {
+                continue;
+            }
+            const bool has_translation = (target.observed_mask.head<3>().array() != 0).all();
+            const bool has_rotation = (target.observed_mask.segment<3>(3).array() != 0).all();
+            if (!has_translation && !has_rotation)
+            {
+                continue;
+            }
+            auto query_node = target.ground_truth;
+            estimator.interpolateMean2D(query_node, state);
+            const Eigen::Matrix4d error_transform =
+                (query_node.pose * invertTransformation(target.ground_truth.pose)).template cast<double>();
+            if (has_translation)
+            {
+                const double error = error_transform.block<3, 1>(0, 3).norm();
+                metrics.translation_mae += error;
+                translation_squared_sum += error * error;
+                ++metrics.translation_count;
+            }
+            if (has_rotation)
+            {
+                const double error = se3::tran2vec(error_transform).tail<3>().norm();
+                metrics.rotation_mae += error;
+                rotation_squared_sum += error * error;
+                ++metrics.rotation_count;
+            }
+        }
+        if (metrics.translation_count > 0)
+        {
+            metrics.translation_mae /= static_cast<double>(metrics.translation_count);
+            metrics.translation_rmse = std::sqrt(translation_squared_sum / metrics.translation_count);
+        }
+        if (metrics.rotation_count > 0)
+        {
+            metrics.rotation_mae /= static_cast<double>(metrics.rotation_count);
+            metrics.rotation_rmse = std::sqrt(rotation_squared_sum / metrics.rotation_count);
+        }
+        return metrics;
+    }
+
     struct TestProblemData
     {
+        struct MeasurementScenario
+        {
+            Spacetime::RobotTopology robot_topology;
+            std::vector<spacetime::OptimizationProblem::Node> nodes;
+            std::vector<std::shared_ptr<Spacetime::Factors::Factor>> factors;
+            std::vector<std::vector<int>> factor_node_indices;
+            std::vector<spacetime::ValidationTarget> validation_targets;
+        };
+
         Spacetime::RobotTopology robot_topology;
         Spacetime::Options estimator_options;
         Eigen::VectorXd initial_theta;
@@ -1788,22 +2504,47 @@ namespace // anonymous
         std::vector<std::shared_ptr<Spacetime::Factors::Factor>> factors;
         std::vector<std::vector<int>> factor_node_indices;
         std::vector<spacetime::ValidationTarget> validation_targets;
+        std::vector<MeasurementScenario> measurement_scenarios;
         std::filesystem::path csv_path;
     };
 
-    TestProblemData buildMinimalTestProblemData()
+    TestProblemData buildMinimalTestProblemData(bool physical_data = false,
+                                              const std::string& trial_override = "",
+                                              double window_duration_override = -1.0,
+                                              int window_count_override = -1)
     {
         TestProblemData data;
 
+        std::string trial_config_location = "assets/config/trial/minimal.json";
+        if (physical_data)
+        {
+            const std::filesystem::path bilevel_config_path = resolveExistingPath({
+                "assets/config/bilevel_optimizer/bilevel_config.json",
+                "../assets/config/bilevel_optimizer/bilevel_config.json",
+                "../../assets/config/bilevel_optimizer/bilevel_config.json"
+            });
+            const Json::Value bilevel_config = loadJsonFile(bilevel_config_path);
+            trial_config_location = bilevel_config.get(
+                "physical_trial_config", "assets/config/trial/fast_contact.json").asString();
+            if (trial_config_location.empty())
+            {
+                throw std::runtime_error("physical_trial_config must specify a trial config path.");
+            }
+        }
+        if (!trial_override.empty())
+        {
+            trial_config_location = trial_override;
+        }
+        const std::string robot_config_name = physical_data ? "robot1.json" : "minimal.json";
         const std::filesystem::path trial_config_path = resolveExistingPath({
-            "assets/config/trial/minimal.json",
-            "../assets/config/trial/minimal.json",
-            "../../assets/config/trial/minimal.json"
+            trial_config_location,
+            std::filesystem::path("..") / trial_config_location,
+            std::filesystem::path("../..") / trial_config_location
         });
         const std::filesystem::path robot_config_path = resolveExistingPath({
-            "assets/config/robot/minimal.json",
-            "../assets/config/robot/minimal.json",
-            "../../assets/config/robot/minimal.json"
+            "assets/config/robot/" + robot_config_name,
+            "../assets/config/robot/" + robot_config_name,
+            "../../assets/config/robot/" + robot_config_name
         });
         const std::filesystem::path estimator_config_path = resolveExistingPath({
             "assets/config/estimator/batch.json",
@@ -1819,7 +2560,8 @@ namespace // anonymous
         // Estimator (e.g., prior-only ground-truth sampling).
         loadEstimatorOptionsFromJson(estimator_config, data.estimator_options);
 
-        data.initial_theta = loadInitialThetaFromRobotConfig(robot_config);
+        const Eigen::VectorXd ground_truth_theta = loadInitialThetaFromRobotConfig(robot_config);
+        data.initial_theta = ground_truth_theta;
 
         loadRobotTopologyFromJson(robot_config, data.robot_topology);
         loadTrialInitialConditionFromJson(trial_config, data.robot_topology);
@@ -1829,24 +2571,25 @@ namespace // anonymous
         const Json::Value perturbation_multiplier_root = robot_config["weights"]["perturbation_multiplier"];
         if (!perturbation_multiplier_root.isNull())
         {
-            if (!perturbation_multiplier_root.isArray() || static_cast<int>(perturbation_multiplier_root.size()) != kThetaSize)
+            if (!perturbation_multiplier_root.isArray() ||
+                (perturbation_multiplier_root.size() != kThetaSize && perturbation_multiplier_root.size() != kQ4Offset))
             {
-                throw std::runtime_error("Robot config weights 'perturbation_multiplier' must be an array of size 36.");
+                throw std::runtime_error("perturbation_multiplier must contain 42 entries, or 36 legacy entries (Q4 unperturbed).");
             }
 
-            for (int i = 0; i < kThetaSize; ++i)
+            for (unsigned int i = 0; i < perturbation_multiplier_root.size(); ++i)
             {
                 data.perturbation_multiplier(i) = perturbation_multiplier_root[i].asDouble();
-                if (!(data.perturbation_multiplier(i) > 0.0))
+                if (!std::isfinite(data.perturbation_multiplier(i)) || !(data.perturbation_multiplier(i) > 0.0))
                 {
                     throw std::runtime_error("Robot config weights 'perturbation_multiplier' must contain strictly positive values.");
                 }
             }
         }
-        const int validation_interval = options_root.isMember("validation_interval") ? options_root["validation_interval"].asInt() : 1;
         const bool prior_only_ground_truth_mode = options_root.isMember("prior_only_ground_truth_mode") ? options_root["prior_only_ground_truth_mode"].asBool() : false;
         const int validation_sample_count = options_root.isMember("validation_sample_count") ? options_root["validation_sample_count"].asInt() : 100;
         const unsigned int validation_rng_seed = options_root.isMember("validation_rng_seed") ? options_root["validation_rng_seed"].asUInt() : 7u;
+        const unsigned int measurement_rng_seed = options_root.isMember("measurement_rng_seed") ? options_root["measurement_rng_seed"].asUInt() : validation_rng_seed + 1u;
         const ObservedMask18 validation_observed_mask = buildObservedMaskFromTrialDataFlags(trial_data_root);
 
         data.initial_theta = data.initial_theta.cwiseProduct(data.perturbation_multiplier);
@@ -1872,6 +2615,7 @@ namespace // anonymous
         data.factors.clear();
         data.factor_node_indices.clear();
         data.validation_targets.clear();
+        data.measurement_scenarios.clear();
 
         if (prior_only_ground_truth_mode)
         {
@@ -1879,221 +2623,403 @@ namespace // anonymous
             {
                 throw std::runtime_error("validation_sample_count must be positive in prior_only_ground_truth_mode.");
             }
+            if (data.robot_topology.N == 0 || data.robot_topology.K == 0)
+            {
+                throw std::runtime_error("Robot topology N and K must be positive in prior_only_ground_truth_mode.");
+            }
 
-            // Build a single unary+time pair trajectory. Multiple independent
-            // GT examples are generated by drawing many prior samples over this pair.
+            // Build the configured spatial-temporal grid. Multiple independent
+            // GT examples are generated by drawing prior samples over this grid.
             data.nodes.clear();
-            data.robot_topology.N = 1;
-            data.robot_topology.K = 2;
             data.robot_topology.t0 = trial_start_time;
-            const double dt_pair = (trial_end_time > trial_start_time)
+            data.robot_topology.T = (trial_end_time > trial_start_time)
                 ? (trial_end_time - trial_start_time)
                 : 1.0;
-            data.robot_topology.T = dt_pair;
+            if (data.robot_topology.N > 1 && !(data.robot_topology.L > 0.0))
+            {
+                throw std::runtime_error("Robot topology length must be positive when N is greater than one.");
+            }
 
             for (int k = 0; k < static_cast<int>(data.robot_topology.K); ++k)
             {
-                spacetime::OptimizationProblem::Node node;
-                node.pose = Eigen::Matrix<double, 4, 4>::Identity();
-                node.epsilon = Eigen::Matrix<double, 6, 1>::Zero();
-                node.varpi = Eigen::Matrix<double, 6, 1>::Zero();
-                node.arclength = 0.0;
-                node.time = trial_start_time + (k == 0 ? 0.0 : dt_pair);
-                data.nodes.push_back(node);
+                const double time_fraction = data.robot_topology.K > 1
+                    ? static_cast<double>(k) / static_cast<double>(data.robot_topology.K - 1)
+                    : 0.0;
+                for (int n = 0; n < static_cast<int>(data.robot_topology.N); ++n)
+                {
+                    const double space_fraction = data.robot_topology.N > 1
+                        ? static_cast<double>(n) / static_cast<double>(data.robot_topology.N - 1)
+                        : 0.0;
+                    spacetime::OptimizationProblem::Node node;
+                    node.pose = Eigen::Matrix<double, 4, 4>::Identity();
+                    node.epsilon = Eigen::Matrix<double, 6, 1>::Zero();
+                    node.varpi = Eigen::Matrix<double, 6, 1>::Zero();
+                    node.arclength = space_fraction * data.robot_topology.L;
+                    node.time = trial_start_time + time_fraction * data.robot_topology.T;
+                    data.nodes.push_back(node);
+                }
             }
 
-            if (!data.robot_topology.use_1D_estimator && data.nodes.size() > 1)
+            Spacetime::Options sampling_options = data.estimator_options;
+            sampling_options.compute_covariances = true;
+
+            Spacetime::Estimator sampler(
+                data.robot_topology,
+                buildHyperparametersFromVariance(ground_truth_theta),
+                sampling_options);
+            sampler.setRandomSeed(validation_rng_seed);
+
+            Spacetime::SystemState<DTYPE> mean_state;
+            mean_state.estimation_nodes = data.nodes;
+            mean_state.ib = false;
+
+            const std::vector<Spacetime::SystemState<DTYPE>> samples =
+                sampler.samplePrior(mean_state, data.robot_topology, validation_sample_count);
+            if (samples.empty())
             {
-                Spacetime::Options sampling_options = data.estimator_options;
-                sampling_options.compute_covariances = true;
-
-                Spacetime::Estimator sampler(
-                    data.robot_topology,
-                    buildHyperparametersFromVariance(data.initial_theta),
-                    sampling_options);
-                sampler.setRandomSeed(validation_rng_seed);
-
-                Spacetime::SystemState<DTYPE> mean_state;
-                mean_state.estimation_nodes = data.nodes;
-                mean_state.ib = false;
-
-                const std::vector<Spacetime::SystemState<DTYPE>> samples =
-                    sampler.samplePrior(mean_state, data.robot_topology, validation_sample_count);
-                if (samples.empty())
-                {
-                    throw std::runtime_error("Time-prior sampling did not return any samples.");
-                }
-
-                for (std::size_t sample_idx = 0; sample_idx < samples.size(); ++sample_idx)
-                {
-                    const auto &sampled_state = samples[sample_idx];
-                    if (sampled_state.estimation_nodes.size() != data.nodes.size())
-                    {
-                        throw std::runtime_error("Time-prior sampling returned an unexpected number of nodes.");
-                    }
-
-                    for (std::size_t node_index = 0; node_index < sampled_state.estimation_nodes.size(); ++node_index)
-                    {
-                        spacetime::ValidationTarget target;
-                        target.node_index = static_cast<int>(node_index);
-                        target.sample_group_id = static_cast<int>(sample_idx);
-                        target.ground_truth = sampled_state.estimation_nodes[node_index];
-                        target.observed_mask = validation_observed_mask;
-                        data.validation_targets.push_back(target);
-                    }
-                }
-
-                data.validation_variance = empiricalValidationVarianceFromSamples(
-                    data.nodes,
-                    samples);
+                throw std::runtime_error("Prior sampling did not return any samples.");
             }
-            else
+
+            const bool simulate_pose = trial_data_root.get("aurora", false).asBool() ||
+                                       trial_data_root.get("lidar", false).asBool();
+            const bool simulate_gyro = trial_data_root.get("gyro", false).asBool();
+            Eigen::Matrix<double, 6, 6> pose_covariance = data.R_pose.asDiagonal();
+            Eigen::Matrix<double, 3, 3> gyro_covariance = data.R_gyro.asDiagonal();
+            std::default_random_engine measurement_rng(measurement_rng_seed);
+            std::normal_distribution<double> standard_normal(0.0, 1.0);
+
+            data.measurement_scenarios.reserve(samples.size());
+            for (std::size_t sample_idx = 0; sample_idx < samples.size(); ++sample_idx)
             {
-                Eigen::VectorXd gt_cov_diag = Eigen::VectorXd::Zero(18); // "Ground Truth" covariance
-                if (options_root.isMember("ground_truth_covariance_diagonal"))
+                const auto &sampled_state = samples[sample_idx];
+                if (sampled_state.estimation_nodes.size() != data.nodes.size())
                 {
-                    const Json::Value gt_cov = options_root["ground_truth_covariance_diagonal"];
-                    if (!gt_cov.isArray() || gt_cov.size() != 18)
-                    {
-                        throw std::runtime_error("ground_truth_covariance_diagonal must be an array of size 18.");
-                    }
-                    for (int i = 0; i < 18; ++i)
-                    {
-                        gt_cov_diag(i) = gt_cov[i].asDouble();
-                    }
-                }
-                else
-                {
-                    const Json::Value p0 = robot_config["weights"]["P0"];
-                    if (!p0.isArray() || p0.size() != 18)
-                    {
-                        throw std::runtime_error("Robot config weights.P0 must be an array of size 18.");
-                    }
-                    for (int i = 0; i < 18; ++i)
-                    {
-                        gt_cov_diag(i) = p0[i].asDouble();
-                    }
+                    throw std::runtime_error("Prior sampling returned an unexpected number of nodes.");
                 }
 
-                for (int i = 0; i < gt_cov_diag.size(); ++i)
+                TestProblemData::MeasurementScenario scenario;
+                scenario.robot_topology = data.robot_topology;
+                scenario.nodes = data.nodes;
+                for (std::size_t node_index = 0; node_index < sampled_state.estimation_nodes.size(); ++node_index)
                 {
-                    if (!(gt_cov_diag(i) > 0.0))
-                    {
-                        throw std::runtime_error("Ground-truth covariance diagonal entries must be strictly positive.");
-                    }
-                }
-                for (size_t i = 0; i < gt_cov_diag.size(); ++i)
-                {
-                    std::cout << "GT covariance diag[" << i << "] = " << gt_cov_diag[i] << std::endl;
-                }
-                sleep(2);
-                std::mt19937 rng(validation_rng_seed);
-                std::normal_distribution<double> standard_normal(0.0, 1.0);
-                Eigen::Matrix<double, 18, 1> perturbation_sum = Eigen::Matrix<double, 18, 1>::Zero();
-                Eigen::Matrix<double, 18, 1> perturbation_sq_sum = Eigen::Matrix<double, 18, 1>::Zero();
-
-                for (int sample_idx = 0; sample_idx < validation_sample_count; ++sample_idx)
-                {
-                    Eigen::Matrix<double, 18, 1> perturb = Eigen::Matrix<double, 18, 1>::Zero();
-                    for (int i = 0; i < 18; ++i)
-                    {
-                        perturb(i) = std::sqrt(gt_cov_diag(i)) * standard_normal(rng);
-                    }
-                    perturbation_sum += perturb;
-                    perturbation_sq_sum += perturb.array().square().matrix();
-
+                    const auto& ground_truth_node = sampled_state.estimation_nodes[node_index];
+                    const bool is_base_node = node_index % data.robot_topology.N == 0;
                     spacetime::ValidationTarget target;
-                    target.node_index = sample_idx;
-                    target.sample_group_id = sample_idx;
-                    target.ground_truth = data.nodes[static_cast<std::size_t>(sample_idx)];
-                    target.ground_truth.pose = se3::vec2tran(perturb.segment<6>(0)) * target.ground_truth.pose;
-                    target.ground_truth.epsilon += perturb.segment<6>(6);
-                    target.ground_truth.varpi += perturb.segment<6>(12);
+                    target.node_index = static_cast<int>(node_index);
+                    target.sample_group_id = static_cast<int>(sample_idx);
+                    target.ground_truth = ground_truth_node;
                     target.observed_mask = validation_observed_mask;
                     data.validation_targets.push_back(target);
+                    scenario.validation_targets.push_back(target);
+
+                    if (simulate_pose && !is_base_node)
+                    {
+                        Eigen::Matrix<double, 6, 1> noise;
+                        for (int d = 0; d < noise.size(); ++d)
+                        {
+                            noise(d) = std::sqrt(data.R_pose(d)) * standard_normal(measurement_rng);
+                        }
+
+                        Spacetime::SensorMeasurement measurement;
+                        measurement.type = Spacetime::SensorMeasurement::Pose;
+                        measurement.mask = Eigen::Matrix<int, 6, 1>::Ones();
+                        measurement.value = invertTransformation(ground_truth_node.pose) * se3::vec2tran(-noise);
+                        measurement.s = ground_truth_node.arclength;
+                        measurement.t = ground_truth_node.time;
+
+                        auto factor = std::make_shared<Spacetime::Factors::PoseMeasurementFactor>(
+                            pose_covariance, measurement);
+                        const Eigen::VectorXd generated_error = factor->getError({ground_truth_node}).template cast<double>();
+                        if (!generated_error.isApprox(noise, 1e-9))
+                        {
+                            throw std::runtime_error("Generated pose measurement does not match the requested tangent-space noise.");
+                        }
+                        scenario.factors.push_back(factor);
+                        scenario.factor_node_indices.push_back({static_cast<int>(node_index)});
+                    }
+
+                    if (simulate_gyro && !is_base_node)
+                    {
+                        Eigen::Matrix<double, 3, 1> noise;
+                        for (int d = 0; d < noise.size(); ++d)
+                        {
+                            noise(d) = std::sqrt(data.R_gyro(d)) * standard_normal(measurement_rng);
+                        }
+
+                        Spacetime::SensorMeasurement measurement;
+                        measurement.type = Spacetime::SensorMeasurement::Gyro;
+                        measurement.mask = Eigen::Matrix<int, 3, 1>::Ones();
+                        measurement.value = -ground_truth_node.varpi.template tail<3>().template cast<double>() + noise;
+                        measurement.s = ground_truth_node.arclength;
+                        measurement.t = ground_truth_node.time;
+
+                        auto factor = std::make_shared<Spacetime::Factors::GyroMeasurementFactor>(
+                            gyro_covariance, measurement);
+                        const Eigen::VectorXd generated_error = factor->getError({ground_truth_node}).template cast<double>();
+                        if (!generated_error.isApprox(noise, 1e-9))
+                        {
+                            throw std::runtime_error("Generated gyro measurement does not match the requested additive noise.");
+                        }
+                        scenario.factors.push_back(factor);
+                        scenario.factor_node_indices.push_back({static_cast<int>(node_index)});
+                    }
                 }
 
-                const double sample_count = static_cast<double>(validation_sample_count);
-                const Eigen::Matrix<double, 18, 1> perturbation_mean = perturbation_sum / sample_count;
-                data.validation_variance = (perturbation_sq_sum / sample_count - perturbation_mean.array().square().matrix()).cwiseMax(0.0);
+                const std::size_t measured_node_count = sampled_state.estimation_nodes.size() - data.robot_topology.K;
+                const std::size_t factors_per_measured_node = static_cast<std::size_t>(simulate_pose) +
+                                                              static_cast<std::size_t>(simulate_gyro);
+                if (scenario.factors.size() != measured_node_count * factors_per_measured_node)
+                {
+                    throw std::runtime_error("Synthetic measurement generation produced an unexpected factor count.");
+                }
+                data.measurement_scenarios.push_back(std::move(scenario));
             }
+
+            data.validation_variance = empiricalValidationVarianceFromSamples(
+                data.nodes,
+                samples);
         }
         else
         {
+            if (!physical_data)
+            {
+                throw std::runtime_error("Physical data mode must be selected with --physical when prior_only_ground_truth_mode is false.");
+            }
+
+            if (!(trial_end_time > trial_start_time) || !std::isfinite(trial_end_time))
+            {
+                throw std::runtime_error("Physical data requires a finite interval with end_time greater than start_time.");
+            }
+
+            const Json::Value topology_root = robot_config["topology"];
+            if (!topology_root.isMember("K_per_second"))
+            {
+                throw std::runtime_error("Physical data robot topology must define K_per_second.");
+            }
+            const double K_per_second = topology_root["K_per_second"].asDouble();
+            if (!(K_per_second > 0.0))
+            {
+                throw std::runtime_error("K_per_second must be positive for physical data.");
+            }
+
+            const double configured_window_duration = window_duration_override >= 0.0
+                ? window_duration_override : options_root.get("physical_window_duration", 0.0).asDouble();
+            if (!std::isfinite(configured_window_duration) || configured_window_duration < 0.0)
+            {
+                throw std::runtime_error("physical_window_duration must be finite and nonnegative.");
+            }
+            const bool use_physical_windows = configured_window_duration > 0.0;
+            const double window_duration = use_physical_windows
+                ? configured_window_duration
+                : trial_end_time - trial_start_time;
+            const int requested_window_count = use_physical_windows
+                ? (window_count_override > 0 ? window_count_override : options_root.get("measurement_sample_count", 10).asInt())
+                : 1;
+            if (requested_window_count <= 0)
+            {
+                throw std::runtime_error("measurement_sample_count must be positive when physical windowing is enabled.");
+            }
+
+            const double window_stride = use_physical_windows ? window_duration / 2.0 : window_duration;
+            const int available_window_count = std::max(1, 1 + static_cast<int>(std::ceil(
+                (trial_end_time - trial_start_time - window_duration) / window_stride)));
+            const int window_count = std::min(requested_window_count, available_window_count);
+            const double measurement_factor = robot_config["weights"].get("measurement_factor", 1.0).asDouble();
+            const Eigen::Matrix<double, 6, 6> pose_covariance = measurement_factor * data.R_pose.asDiagonal();
+            const Eigen::Matrix<double, 3, 3> gyro_covariance = measurement_factor * data.R_gyro.asDiagonal();
+            const bool include_aurora = trial_data_root.get("aurora", false).asBool();
+            const bool include_gyro = trial_data_root.get("gyro", false).asBool();
+            const bool exclude_base_measurements = options_root.get("exclude_base_measurements", false).asBool();
+
+            struct PhysicalRecord
+            {
+                std::string sensor_type;
+                Spacetime::SensorMeasurement measurement;
+            };
+            std::vector<PhysicalRecord> records;
+
             for (const auto& entry : std::filesystem::directory_iterator(data_dir))
             {
-                if (entry.is_regular_file() && entry.path().extension() == ".csv")
-                {
-                    data.csv_path = entry.path();
-                    break;
-                }
-            }
-
-            if (data.csv_path.empty())
-            {
-                throw std::runtime_error("No CSV file found in minimal data directory: " + data_dir.string());
-            }
-
-            const std::vector<std::vector<std::string>> csv_rows = readCsvRows(data.csv_path);
-            if (csv_rows.size() < 3)
-            {
-                throw std::runtime_error("Minimal CSV must contain at least one pose measurement row.");
-            }
-
-            Eigen::Matrix<double, 6, 6> pose_weight = Eigen::Matrix<double, 6, 6>::Zero();
-            for (int i = 0; i < 6; ++i)
-            {
-                pose_weight(i, i) = robot_config["weights"]["R_pose"][i].asDouble();
-            }
-
-            for (size_t row_index = 2; row_index < csv_rows.size(); ++row_index)
-            {
-                const auto& row = csv_rows[row_index];
-                if (row.size() < 8)
+                if (!entry.is_regular_file() || entry.path().extension() != ".csv")
                 {
                     continue;
                 }
 
-                const double row_time = std::stod(row[0]);
-                if (row_time < trial_start_time || row_time > trial_end_time)
+                const std::vector<std::vector<std::string>> csv_rows = readCsvRows(entry.path());
+                if (csv_rows.size() < 3 || csv_rows.front().size() < 2)
                 {
                     continue;
                 }
 
-                spacetime::OptimizationProblem::Node node;
-                node.pose = data.robot_topology.T0;
-                node.epsilon = data.robot_topology.epsilon0;
-                node.varpi = data.robot_topology.varpi0;
-                node.arclength = std::stod(row[1]);
-                node.time = row_time;
-                data.nodes.push_back(node);
-
-                Spacetime::SensorMeasurement measurement;
-                measurement.type = Spacetime::SensorMeasurement::Pose;
-                measurement.mask = Eigen::Matrix<int, 6, 1>::Ones();
-                measurement.value = se3::vec2tran(parsePoseRow(row));
-                measurement.s = std::stod(row[1]);
-                measurement.t = node.time;
-
-                data.factors.push_back(std::make_shared<Spacetime::Factors::PoseMeasurementFactor>(pose_weight, measurement));
-                data.factor_node_indices.push_back({static_cast<int>(data.nodes.size() - 1)});
-
-                // Use a sparse subset of nodes as validation targets to exercise the upper-level loop.
-                if ((data.nodes.size() - 1) % validation_interval == 0)
+                std::string sensor_type = csv_rows.front()[1];
+                sensor_type.erase(std::remove(sensor_type.begin(), sensor_type.end(), '\r'), sensor_type.end());
+                if (sensor_type != "vicon" && sensor_type != "aurora" && sensor_type != "gyro")
                 {
-                    spacetime::ValidationTarget target;
-                    target.node_index = static_cast<int>(data.nodes.size() - 1);
-                    target.sample_group_id = 0;
-                    target.ground_truth = node;
-                    target.ground_truth.pose = measurement.value;
-                    target.observed_mask = ObservedMask18::Zero();
-                    for (int d = 0; d < 6; ++d)
+                    continue;
+                }
+
+                for (std::size_t row_index = 2; row_index < csv_rows.size(); ++row_index)
+                {
+                    const auto& row = csv_rows[row_index];
+                    const std::size_t expected_size = sensor_type == "gyro" ? 5 : 8;
+                    if (row.size() < expected_size)
                     {
-                        target.observed_mask(d) = measurement.mask(d, 0);
+                        continue;
                     }
-                    data.validation_targets.push_back(target);
+
+                    Spacetime::SensorMeasurement measurement;
+                    measurement.t = std::stod(row[0]);
+                    measurement.s = std::stod(row[1]);
+                    if (measurement.t < trial_start_time || measurement.t > trial_end_time)
+                    {
+                        continue;
+                    }
+
+                    if (sensor_type == "gyro")
+                    {
+                        measurement.type = Spacetime::SensorMeasurement::Gyro;
+                        measurement.mask = Eigen::Matrix<int, 3, 1>::Ones();
+                        measurement.value = Eigen::MatrixXd::Zero(3, 1);
+                        for (int i = 0; i < 3; ++i)
+                        {
+                            measurement.value(i, 0) = std::stod(row[2 + i]);
+                        }
+                    }
+                    else
+                    {
+                        measurement.type = Spacetime::SensorMeasurement::Pose;
+                        measurement.mask = Eigen::Matrix<int, 6, 1>::Ones();
+                        measurement.value = se3::vec2tran(parsePoseRow(row));
+                    }
+                    records.push_back({sensor_type, measurement});
                 }
             }
+
+            std::sort(records.begin(), records.end(), [](const PhysicalRecord& lhs, const PhysicalRecord& rhs) {
+                return lhs.measurement.t < rhs.measurement.t ||
+                       (lhs.measurement.t == rhs.measurement.t && lhs.measurement.s < rhs.measurement.s);
+            });
+
+            for (int window_index = 0; window_index < window_count; ++window_index)
+            {
+                const double window_start = trial_start_time + static_cast<double>(window_index) * window_stride;
+                const double window_end = std::min(window_start + window_duration, trial_end_time);
+                const double actual_duration = window_end - window_start;
+                if (!(actual_duration > 0.0))
+                {
+                    continue;
+                }
+
+                TestProblemData::MeasurementScenario scenario;
+                scenario.robot_topology = data.robot_topology;
+                scenario.robot_topology.t0 = window_start;
+                scenario.robot_topology.T = actual_duration;
+                scenario.robot_topology.K = static_cast<unsigned int>(std::ceil(K_per_second * actual_duration)) + 1;
+                scenario.nodes.reserve(static_cast<std::size_t>(scenario.robot_topology.N) * scenario.robot_topology.K);
+
+                for (unsigned int k = 0; k < scenario.robot_topology.K; ++k)
+                {
+                    const double time_fraction = scenario.robot_topology.K > 1
+                        ? static_cast<double>(k) / static_cast<double>(scenario.robot_topology.K - 1)
+                        : 0.0;
+                    for (unsigned int n = 0; n < scenario.robot_topology.N; ++n)
+                    {
+                        const double space_fraction = scenario.robot_topology.N > 1
+                            ? static_cast<double>(n) / static_cast<double>(scenario.robot_topology.N - 1)
+                            : 0.0;
+                        spacetime::OptimizationProblem::Node node;
+                        node.arclength = space_fraction * scenario.robot_topology.L;
+                        node.time = window_start + time_fraction * actual_duration;
+                        node.pose = se3::vec2tran(node.arclength * scenario.robot_topology.epsilon0) * scenario.robot_topology.T0;
+                        node.epsilon = scenario.robot_topology.epsilon0;
+                        node.varpi = scenario.robot_topology.varpi0;
+                        scenario.nodes.push_back(node);
+                    }
+                }
+
+                for (const PhysicalRecord& record : records)
+                {
+                    const bool is_last_window = window_index + 1 == window_count;
+                    if (record.measurement.t < window_start || record.measurement.t > window_end ||
+                        (!is_last_window && record.measurement.t == window_end))
+                    {
+                        continue;
+                    }
+
+                    const bool excluded_base_measurement =
+                        exclude_base_measurements &&
+                        record.sensor_type != "vicon" &&
+                        std::abs(record.measurement.s) < TOLERANCE;
+                    if (excluded_base_measurement)
+                    {
+                        continue;
+                    }
+                    if (record.sensor_type == "aurora" && include_aurora)
+                    {
+                        scenario.factors.push_back(std::make_shared<Spacetime::Factors::PoseMeasurementFactor>(pose_covariance, record.measurement));
+                    }
+                    else if (record.sensor_type == "gyro" && include_gyro)
+                    {
+                        scenario.factors.push_back(std::make_shared<Spacetime::Factors::GyroMeasurementFactor>(gyro_covariance, record.measurement));
+                    }
+                    else if (record.sensor_type == "vicon")
+                    {
+                        const double time_fraction = (record.measurement.t - window_start) / actual_duration;
+                        const double space_fraction = scenario.robot_topology.L > 0.0
+                            ? record.measurement.s / scenario.robot_topology.L
+                            : 0.0;
+                        const int k = std::clamp(
+                            static_cast<int>(std::llround(time_fraction * static_cast<double>(scenario.robot_topology.K - 1))),
+                            0,
+                            static_cast<int>(scenario.robot_topology.K - 1));
+                        const int n = std::clamp(
+                            static_cast<int>(std::llround(space_fraction * static_cast<double>(scenario.robot_topology.N - 1))),
+                            0,
+                            static_cast<int>(scenario.robot_topology.N - 1));
+                        const int node_index = k * static_cast<int>(scenario.robot_topology.N) + n;
+
+                        spacetime::ValidationTarget target;
+                        target.node_index = node_index;
+                        target.sample_group_id = window_index;
+                        target.ground_truth = scenario.nodes[static_cast<std::size_t>(node_index)];
+                        target.ground_truth.time = record.measurement.t;
+                        target.ground_truth.arclength = scenario.nodes[static_cast<std::size_t>(node_index)].arclength;
+                        target.interpolate_time = true;
+                        target.ground_truth.pose = invertTransformation(record.measurement.value);
+                        Spacetime::Factors::PoseMeasurementFactor convention_check(pose_covariance, record.measurement);
+                        if (!convention_check.getError({target.ground_truth}).isZero(1e-9))
+                        {
+                            throw std::runtime_error("Vicon validation pose is inconsistent with pose measurement convention.");
+                        }
+                        target.observed_mask = ObservedMask18::Zero();
+                        target.observed_mask.segment<6>(0).setOnes();
+                        scenario.validation_targets.push_back(target);
+                    }
+                }
+
+                if (!scenario.factors.empty() && !scenario.validation_targets.empty())
+                {
+                    data.measurement_scenarios.push_back(std::move(scenario));
+                }
+            }
+
+            if (data.measurement_scenarios.empty())
+            {
+                throw std::runtime_error("Physical data did not produce any windows containing both measurements and Vicon validation targets.");
+            }
+
+            data.validation_sample_count = static_cast<int>(data.measurement_scenarios.size());
+            data.robot_topology = data.measurement_scenarios.front().robot_topology;
+            data.nodes = data.measurement_scenarios.front().nodes;
+            data.factors = data.measurement_scenarios.front().factors;
+            data.factor_node_indices = data.measurement_scenarios.front().factor_node_indices;
+            data.validation_targets = data.measurement_scenarios.front().validation_targets;
+            data.csv_path = data_dir;
+
+            std::cout << "Loaded " << data.measurement_scenarios.size()
+                      << " physical windows at K_per_second=" << K_per_second
+                      << "; first window K=" << data.robot_topology.K
+                      << ", N=" << data.robot_topology.N << std::endl;
         }
 
         if (data.nodes.empty())
@@ -2124,6 +3050,118 @@ namespace // anonymous
         }
 
         return data;
+    }
+
+    void writeReportJson(std::ostream& stream, const Json::Value& value)
+    {
+        Json::StreamWriterBuilder writer;
+        writer["commentStyle"] = "None";
+        stream << Json::writeString(writer, value);
+        if (!stream) throw std::runtime_error("Failed to write JSON report.");
+    }
+
+    spacetime::OptimizationProblem makePhysicalProblem(
+        const TestProblemData& data, const TestProblemData::MeasurementScenario& scenario,
+        const Eigen::VectorXd& theta)
+    {
+        spacetime::OptimizationProblem problem;
+        problem.setEstimatorOptions(data.estimator_options);
+        problem.setRobotTopology(scenario.robot_topology);
+        problem.setRunSummary({data.validation_sample_count, data.R_pose, data.R_gyro, data.validation_variance});
+        problem.setTheta(theta);
+        problem.setProblemData(scenario.nodes, scenario.factors, scenario.factor_node_indices);
+        problem.setValidationTargets(scenario.validation_targets);
+        return problem;
+    }
+
+    struct PhysicalEvaluationTotals
+    {
+        double nll = 0.0;
+        double mahalanobis = 0.0;
+        double translation_sum = 0.0;
+        double translation_squared_sum = 0.0;
+        double rotation_sum = 0.0;
+        double rotation_squared_sum = 0.0;
+        std::size_t windows = 0;
+        std::size_t targets = 0;
+        int observed_dimensions = 0;
+
+        void add(const PhysicalEvaluationTotals& other)
+        {
+            nll += other.nll;
+            mahalanobis += other.mahalanobis;
+            translation_sum += other.translation_sum;
+            translation_squared_sum += other.translation_squared_sum;
+            rotation_sum += other.rotation_sum;
+            rotation_squared_sum += other.rotation_squared_sum;
+            windows += other.windows;
+            targets += other.targets;
+            observed_dimensions += other.observed_dimensions;
+        }
+    };
+
+    void writePhysicalEvaluationRow(std::ostream& stream, const std::string& split,
+                                    const std::string& trial, const std::string& window,
+                                    double start, double end, const PhysicalEvaluationTotals& totals)
+    {
+        const double target_count = static_cast<double>(totals.targets);
+        stream << split << ',' << trial << ',' << window << ',' << start << ',' << end << ','
+               << totals.windows << ',' << totals.targets << ',' << totals.observed_dimensions << ','
+               << totals.nll << ',' << totals.nll / totals.windows << ','
+               << totals.nll / totals.observed_dimensions << ',' << totals.mahalanobis / target_count << ','
+               << totals.translation_sum / target_count << ','
+               << std::sqrt(totals.translation_squared_sum / target_count) << ','
+               << totals.rotation_sum / target_count << ','
+               << std::sqrt(totals.rotation_squared_sum / target_count) << '\n';
+        stream.flush();
+    }
+
+    PhysicalEvaluationTotals evaluatePhysicalWindows(
+        const TestProblemData& data, std::size_t begin, std::size_t count,
+        const Eigen::VectorXd& theta, bool joint, const std::string& split,
+        const std::string& trial, std::ostream& windows_log, std::ostream& summary_log)
+    {
+        PhysicalEvaluationTotals totals;
+        for (std::size_t index = 0; index < count; ++index)
+        {
+            const auto& scenario = data.measurement_scenarios.at(begin + index);
+            auto problem = makePhysicalProblem(data, scenario, theta);
+            const auto solution = problem.solveLowerLevel(false);
+            Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver(solution.H);
+            if (solver.info() != Eigen::Success)
+            {
+                throw std::runtime_error("Held-parameter evaluation Hessian factorization failed.");
+            }
+            const auto& targets = problem.validationTargets();
+            const auto& nodes = problem.solvedNodes();
+            const auto cache = buildJointValidationCache(solution.H, targets, nodes, solver, &theta, joint);
+            const auto group = buildJointValidationGroupData(solution.H, targets, nodes, cache, false);
+            const auto validation = computeValidationLossWithJoint(targets, cache, group);
+            PhysicalEvaluationTotals window;
+            window.windows = 1;
+            window.targets = targets.size();
+            window.observed_dimensions = cache.observed_dim_total;
+            window.nll = validation.loss;
+            window.mahalanobis = validation.mahalanobis_sum;
+            for (const auto& target : targets)
+            {
+                const auto estimate = interpolateValidationTime(target, nodes).estimate;
+                const Eigen::Matrix4d error = estimate.pose * invertTransformation(target.ground_truth.pose);
+                const double translation = error.block<3, 1>(0, 3).norm();
+                const double rotation = se3::tran2vec(error).tail<3>().norm();
+                window.translation_sum += translation;
+                window.translation_squared_sum += translation * translation;
+                window.rotation_sum += rotation;
+                window.rotation_squared_sum += rotation * rotation;
+            }
+            writePhysicalEvaluationRow(windows_log, split, trial, std::to_string(index),
+                scenario.robot_topology.t0, scenario.robot_topology.t0 + scenario.robot_topology.T, window);
+            totals.add(window);
+            std::cout << "Frozen-parameter " << split << " evaluation: " << trial
+                      << " window " << index + 1 << '/' << count << ", NLL=" << validation.loss << std::endl;
+        }
+        writePhysicalEvaluationRow(summary_log, split, trial, "all", 0.0, 0.0, totals);
+        return totals;
     }
 }
 
@@ -2186,7 +3224,7 @@ namespace spacetime {
     {
         if (theta.size() != kThetaSize)
         {
-            throw std::runtime_error("OptimizationProblem::setTheta expects exactly 36 parameters arranged as P0(18), Q1(6), Q2(6), and Q3(6).");
+            throw std::runtime_error("OptimizationProblem::setTheta expects 42 parameters: P0(18), Q1(6), Q2(6), Q3(6), Q4(6).");
         }
 
         theta_ = theta;
@@ -2201,6 +3239,7 @@ namespace spacetime {
         factors_ = factors;
         factor_node_indices_ = factor_node_indices;
         solved_nodes_ = nodes_;
+        has_lower_solution_ = false;
     }
 
     void OptimizationProblem::setEstimatorOptions(const Spacetime::Options &options)
@@ -2222,6 +3261,7 @@ namespace spacetime {
         fillDiagonalFromVariance(hyperparameters_.Q1, theta_, kQ1Offset, "Q1");
         fillDiagonalFromVariance(hyperparameters_.Q2, theta_, kQ2Offset, "Q2");
         fillDiagonalFromVariance(hyperparameters_.Q3, theta_, kQ3Offset, "Q3");
+        fillDiagonalFromVariance(hyperparameters_.Q4, theta_, kQ4Offset, "Q4");
     }
 
     LowerLevelSolution OptimizationProblem::solveLowerLevel(bool verbose) // Returns x*, H and linearisation data.
@@ -2344,7 +3384,7 @@ namespace spacetime {
 
         if (theta_.size() != kThetaSize)
         {
-            throw std::runtime_error("OptimizationProblem: theta has not been initialized with 36 parameters.");
+            throw std::runtime_error("OptimizationProblem: theta has not been initialized with 42 parameters.");
         }
 
         const Spacetime::Hyperparameters hyper = hyperparameters_;
@@ -2356,22 +3396,35 @@ namespace spacetime {
         }
 
         options.init_guess_type = Spacetime::Options::InitialGuessType::Custom;
-        options.custom_guess.estimation_nodes = nodes_;
+        options.custom_guess.estimation_nodes = has_lower_solution_ ? solved_nodes_ : nodes_;
         options.estimator_type = Spacetime::Options::EstimatorType::Batch;
 
         Spacetime::Estimator estimator(topology, hyper, options);
+        const auto t_lower_solve_start = std::chrono::steady_clock::now();
         const auto estimate = estimator.computeStateEstimate(measurement_factors, verbose);
+        const auto t_lower_solve_end = std::chrono::steady_clock::now();
+        solution.lower_solve_ms = std::chrono::duration<double, std::milli>(
+            t_lower_solve_end - t_lower_solve_start).count();
         if (!estimate.success)
         {
-            throw std::runtime_error("OptimizationProblem: Estimator::computeStateEstimate failed in solveLowerLevel().");
+            throw std::runtime_error(
+                "OptimizationProblem: Estimator::computeStateEstimate failed in solveLowerLevel(): " +
+                estimate.message.str());
         }
+
+        solution.tip_metrics = computePoseValidationMetrics(estimator, estimate.state, validation_targets_, topology, true);
+        solution.body_metrics = computePoseValidationMetrics(estimator, estimate.state, validation_targets_, topology, false);
 
         Eigen::SparseMatrix<double> H_est;
         std::vector<Eigen::VectorXd> factor_errors;
         std::vector<Eigen::MatrixXd> factor_jacobians;
         std::vector<Eigen::MatrixXd> factor_Qs;
         std::vector<std::vector<int>> factor_node_offsets;
+        const auto t_extract_hessian_start = std::chrono::steady_clock::now();
         estimator.extractJacobianHessian(estimate.state, H_est, factor_errors, factor_jacobians, factor_Qs, factor_node_offsets);
+        const auto t_extract_hessian_end = std::chrono::steady_clock::now();
+        solution.extract_hessian_ms = std::chrono::duration<double, std::milli>(
+            t_extract_hessian_end - t_extract_hessian_start).count();
         /*
         if(verbose)
         {
@@ -2426,6 +3479,7 @@ namespace spacetime {
         robot_topology_ = topology;
         robot_topology_set_ = true;
         solved_nodes_ = estimate.state.estimation_nodes;
+        has_lower_solution_ = true;
         return solution;
     }
 
@@ -2463,6 +3517,15 @@ namespace spacetime {
         if (h_solver.info() != Eigen::Success)
         {
             throw std::runtime_error("OptimizationProblem::computeValidationLoss: failed to factorize H for node marginals.");
+        }
+
+        if (std::any_of(validation_targets_.begin(), validation_targets_.end(), [](const ValidationTarget& target) {
+                return target.interpolate_time;
+            }))
+        {
+            const auto cache = buildJointValidationCache(solution.H, validation_targets_, solved_nodes_, h_solver, &theta_, false);
+            const auto group = buildJointValidationGroupData(solution.H, validation_targets_, solved_nodes_, cache, false);
+            return computeValidationLossWithJoint(validation_targets_, cache, group);
         }
 
         for (int i = 0; i < validation_count; ++i)
@@ -2529,6 +3592,15 @@ namespace spacetime {
             throw std::runtime_error("OptimizationProblem::computeAdjointRhs: failed to factorize H for node marginals.");
         }
 
+        if (std::any_of(validation_targets_.begin(), validation_targets_.end(), [](const ValidationTarget& target) {
+                return target.interpolate_time;
+            }))
+        {
+            const auto cache = buildJointValidationCache(solution.H, validation_targets_, solved_nodes_, h_solver, &theta_, false);
+            const auto group = buildJointValidationGroupData(solution.H, validation_targets_, solved_nodes_, cache);
+            return computeAdjointRhsWithJoint(solution.H, validation_targets_, cache, group);
+        }
+
         for (int i = 0; i < validation_count; ++i)
         {
             const auto &target = validation_targets_[static_cast<size_t>(i)];
@@ -2573,7 +3645,7 @@ namespace spacetime {
                 throw std::runtime_error("OptimizationProblem::computeValidationErrors: validation node index out of range.");
             }
             errors.segment<18>(static_cast<int>(i) * node_dim) =
-                computeNodeValidationError(solved_nodes_[static_cast<size_t>(target.node_index)], target.ground_truth);
+                computeNodeValidationError(interpolateValidationTime(target, solved_nodes_).estimate, target.ground_truth);
         }
 
         return errors;
@@ -2612,11 +3684,34 @@ namespace spacetime {
     Optimizer::Optimizer(const OptimizationProblem& problem)
         : problem_(std::make_shared<OptimizationProblem>(problem))
     {
+        scenario_problems_.push_back(problem_);
+    }
+
+    void Optimizer::setScenarioProblems(const std::vector<OptimizationProblem>& problems)
+    {
+        if (problems.empty())
+        {
+            throw std::runtime_error("Optimizer::setScenarioProblems requires at least one problem.");
+        }
+
+        scenario_problems_.clear();
+        scenario_problems_.reserve(problems.size());
+        for (const auto& scenario_problem : problems)
+        {
+            scenario_problems_.push_back(std::make_shared<OptimizationProblem>(scenario_problem));
+        }
+        problem_ = scenario_problems_.front();
     }
 
     void Optimizer::setConfig(const OptimizerConfig& cfg)
     {
         optimizer_config = cfg;
+        if (optimizer_config.lambda_update_mask.size() == kQ4Offset)
+            optimizer_config.lambda_update_mask.resize(kThetaSize, 0);
+        if (optimizer_config.lambda_update_mask.size() != kThetaSize ||
+            std::any_of(optimizer_config.lambda_update_mask.begin(), optimizer_config.lambda_update_mask.end(),
+                [](int value) { return value != 0 && value != 1; }))
+            throw std::runtime_error("lambda_update_mask requires 42 binary entries, or 36 legacy binary entries.");
     }
 
     Optimizer::Result Optimizer::optimize()
@@ -2632,8 +3727,7 @@ namespace spacetime {
             throw std::runtime_error("Optimizer::step requires a valid OptimizationProblem.");
         }
 
-        const auto &validation_targets = problem_->validationTargets();
-        if (validation_targets.empty())
+        if (problem_->validationTargets().empty())
         {
             throw std::runtime_error("Optimizer::step requires validation targets for NLL-based outer optimization.");
         }
@@ -2644,7 +3738,7 @@ namespace spacetime {
             const Eigen::VectorXd &initial_theta = problem_->theta();
             if (initial_theta.size() != kThetaSize)
             {
-                throw std::runtime_error("Optimizer::step could not infer an initial 36-vector theta from the problem.");
+                throw std::runtime_error("Optimizer::step could not infer an initial 42-vector theta from the problem.");
             }
             const Eigen::VectorXd initial_lambda = initial_theta.cwiseInverse();
             current_psi = optimizer_config.use_exponential_param ? initial_lambda.array().log().matrix() : initial_lambda;
@@ -2653,6 +3747,24 @@ namespace spacetime {
         {
             current_psi = psi;
         }
+
+        if (optimizer_config.lambda_update_mask.size() != kThetaSize)
+        {
+            throw std::runtime_error("lambda_update_mask must contain exactly 42 entries.");
+        }
+        std::vector<int> update_mask = optimizer_config.lambda_update_mask;
+        for (int index = 0; index < kThetaSize; ++index)
+        {
+            if (update_mask[index] != 0 && update_mask[index] != 1)
+            {
+                throw std::runtime_error("lambda_update_mask entries must be 0 or 1.");
+            }
+            if (optimizer_config.freeze_p0_non_pose && index >= 6 && index < 18)
+            {
+                update_mask[index] = 0;
+            }
+        }
+        const Eigen::VectorXd initial_psi = current_psi;
 
         //lambda = exp(psi) if use_exponential_param is true, otherwise lambda = psi
         auto mapLambda = [&](const Eigen::VectorXd &unconstrained) -> Eigen::VectorXd {
@@ -2674,6 +3786,10 @@ namespace spacetime {
         double beta1_power = 1.0;
         double beta2_power = 1.0;
         double previous_loss = std::numeric_limits<double>::infinity();
+        Eigen::VectorXd effective_learning_rates = Eigen::VectorXd::Constant(current_psi.size(), optimizer_config.learning_rate);
+        OscillationDetector oscillation_detector;
+        int oscillation_reductions = 0;
+        std::vector<int> dimension_reductions(current_psi.size(), 0);
         const std::filesystem::path outer_loop_log_path = resolveAssetsLogPath("bilevel_optimizer_outer_loop_" + formatTimestamp() + ".log");
         std::ofstream outer_loop_log(outer_loop_log_path, std::ios::out | std::ios::trunc);
         if (!outer_loop_log.is_open())
@@ -2691,16 +3807,77 @@ namespace spacetime {
             outer_loop_log << ",dL_dlambda[" << i << "]";
         }
         outer_loop_log << ",mean_mahalanobis,mean_logdet,validation_nll"
-                  << ",objective_mode,g_joint_norm,q_joint_norm,adjoint_rhs_norm,quadratic_rhs_norm,adjoint_state_norm,quadratic_state_norm,pv_min_eig,pv_max_eig,pv_condition\n";
+                   << ",tip_mae_m,tip_rmse_m,tip_rotation_mae_rad,tip_rotation_rmse_rad"
+                   << ",body_mae_m,body_rmse_m,body_rotation_mae_rad,body_rotation_rmse_rad"
+                   << ",effective_learning_rate,oscillation_reductions";
+        for (int index = 0; index < kThetaSize; ++index)
+        {
+            outer_loop_log << ",learning_rate[" << index << "],oscillation_reductions[" << index << "]";
+        }
+        outer_loop_log << '\n';
 
         //Main optimization loop
         for (int iter = 0; iter < optimizer_config.max_iterations; ++iter)
         {
             const Eigen::VectorXd lambda = mapLambda(current_psi);
             const Eigen::VectorXd theta = mapVariance(lambda);
-            problem_->setTheta(theta);
+            Eigen::VectorXd variance_gradient_sum = Eigen::VectorXd::Zero(kThetaSize);
+            ValidationLossData averaged_validation;
+            TipValidationMetrics tip_metric_sums;
+            PoseValidationMetrics body_metric_sums;
+            double g_joint_norm_sum = 0.0;
+            double q_joint_norm_sum = 0.0;
+            double adjoint_rhs_norm_sum = 0.0;
+            double quadratic_rhs_norm_sum = 0.0;
+            double adjoint_state_norm_sum = 0.0;
+            double quadratic_state_norm_sum = 0.0;
+            double pv_min_eig_sum = 0.0;
+            double pv_max_eig_sum = 0.0;
+            double pv_condition_sum = 0.0;
+            double lower_solve_ms_sum = 0.0;
+            double extract_hessian_ms_sum = 0.0;
+            double joint_cache_ms_sum = 0.0;
+            double joint_setup_ms_sum = 0.0;
+            double joint_selector_ms_sum = 0.0;
+            double joint_projection_solve_ms_sum = 0.0;
+            double joint_covariance_ms_sum = 0.0;
+            double joint_eigendecomposition_ms_sum = 0.0;
+            double joint_information_ms_sum = 0.0;
+            double adjoint_solves_ms_sum = 0.0;
+            double factor_gradient_loop_ms_sum = 0.0;
 
-            const LowerLevelSolution solution = problem_->solveLowerLevel(optimizer_config.verbose);
+            if (scenario_problems_.empty())
+            {
+                throw std::runtime_error("Optimizer::step requires at least one scenario problem.");
+            }
+
+            for (std::size_t scenario_index = 0; scenario_index < scenario_problems_.size(); ++scenario_index)
+            {
+                problem_ = scenario_problems_[scenario_index];
+                problem_->setTheta(theta);
+                const auto& validation_targets = problem_->validationTargets();
+                if (validation_targets.empty())
+                {
+                    throw std::runtime_error("Optimizer::step requires validation targets for every scenario.");
+                }
+
+                LowerLevelSolution solution;
+                try
+                {
+                    solution = problem_->solveLowerLevel(optimizer_config.verbose);
+                }
+                catch (const std::exception& error)
+                {
+                    throw std::runtime_error(
+                        "Optimizer::step scenario " + std::to_string(scenario_index) +
+                        " lower-level solve failed: " + error.what());
+                }
+                if (optimizer_config.verbose)
+                {
+                    std::cout << "Scenario " << scenario_index << ": lower-level solve complete" << std::endl;
+                }
+                lower_solve_ms_sum += solution.lower_solve_ms;
+                extract_hessian_ms_sum += solution.extract_hessian_ms;
             if (solution.H.rows() == 0)
             {
                 throw std::runtime_error("Optimizer::step received an empty lower-level solution.");
@@ -2721,19 +3898,33 @@ namespace spacetime {
             {
                 throw std::runtime_error("Optimizer::step failed to factorize the lower-level information matrix.");
             }
+            if (optimizer_config.verbose)
+            {
+                std::cout << "Scenario " << scenario_index << ": Hessian factorization complete" << std::endl;
+            }
 
-            const bool use_joint_objective = optimizer_config.use_joint_validation_objective;
+            const bool use_joint_objective = optimizer_config.use_joint_validation_objective ||
+                std::any_of(validation_targets.begin(), validation_targets.end(), [](const ValidationTarget& target) {
+                    return target.interpolate_time;
+                });
             ValidationLossData validation;
             Eigen::VectorXd adjoint_rhs;
             Eigen::VectorXd quadratic_rhs;
+            Eigen::VectorXd direct_validation_gradient = Eigen::VectorXd::Zero(kThetaSize);
             Eigen::MatrixXd logdet_information;
             std::vector<int> logdet_node_indices;
             std::vector<JointGroupLogDetData> joint_group_logdet_data;
+            JointValidationCacheData shared_joint_cache;
+            Eigen::MatrixXd shared_joint_logdet_projection;
+            Eigen::MatrixXd shared_joint_weighted_projection;
             double g_joint_norm = 0.0;
             double q_joint_norm = 0.0;
             double pv_min_eig = 0.0;
             double pv_max_eig = 0.0;
             double pv_condition = 0.0;
+            double joint_cache_ms = 0.0;
+            double adjoint_solves_ms = 0.0;
+            double factor_gradient_loop_ms = 0.0;
 
             if (use_joint_objective)
             {
@@ -2750,6 +3941,8 @@ namespace spacetime {
                 quadratic_rhs = Eigen::VectorXd::Zero(solution.H.rows());
                 joint_group_logdet_data.clear();
                 joint_group_logdet_data.reserve(grouped_validation_targets.size());
+                std::vector<Eigen::VectorXd> group_quadratic_rhs_list;
+                group_quadratic_rhs_list.reserve(grouped_validation_targets.size());
 
                 double total_loss = 0.0;
                 double total_mahalanobis_sum = 0.0;
@@ -2765,68 +3958,133 @@ namespace spacetime {
                 double pv_max_eig_acc = 0.0;
                 double pv_condition_acc = 0.0;
 
+                const auto t_joint_cache_start = std::chrono::steady_clock::now();
+                shared_joint_cache = buildJointValidationCache(
+                    solution.H, grouped_validation_targets.front(), solved_nodes, adjoint_solver, &theta,
+                    optimizer_config.use_joint_validation_objective);
+                const auto t_joint_cache_end = std::chrono::steady_clock::now();
+                joint_cache_ms = std::chrono::duration<double, std::milli>(
+                    t_joint_cache_end - t_joint_cache_start).count();
+                if (optimizer_config.verbose)
+                {
+                    std::cout << "Scenario " << scenario_index << ": "
+                              << (shared_joint_cache.joint_observations ? "joint" : "marginal")
+                              << " validation cache complete"
+                              << "; state_dim=" << solution.H.rows()
+                              << ", observed_dim=" << shared_joint_cache.observed_dim_total
+                              << ", validation_targets=" << grouped_validation_targets.front().size()
+                              << ", full_state=" << shared_joint_cache.full_state_observation << std::endl;
+                }
+                constexpr int node_dim = 18;
+                if (!shared_joint_cache.full_state_observation)
+                {
+                    shared_joint_logdet_projection = shared_joint_cache.h_inv_selector;
+                    shared_joint_weighted_projection = shared_joint_cache.weighted_projection;
+                }
+
                 for (const auto& target_group : grouped_validation_targets)
                 {
-                    const JointValidationCacheData group_cache =
-                        buildJointValidationCache(solution.H, target_group, solved_nodes, adjoint_solver);
+                    const JointValidationGroupData group_data =
+                        buildJointValidationGroupData(solution.H, target_group, solved_nodes, shared_joint_cache);
                     const ValidationLossData group_validation =
-                        computeValidationLossWithJoint(target_group, group_cache);
+                        computeValidationLossWithJoint(target_group, shared_joint_cache, group_data);
 
                     total_loss += group_validation.loss;
+                    direct_validation_gradient += group_data.covariance_theta_gradient / group_count;
                     total_mahalanobis_sum += group_validation.mahalanobis_sum;
                     total_logdet_sum += group_validation.logdet_sum;
                     total_mean_nees += group_validation.mean_nees;
                     total_mean_logdet += group_validation.mean_logdet;
-                    total_effective_validation_count += group_cache.effective_validation_count;
-                    total_observed_dim += group_cache.observed_dim_total;
+                    total_effective_validation_count += shared_joint_cache.effective_validation_count;
+                    total_observed_dim += shared_joint_cache.observed_dim_total;
 
-                    adjoint_rhs += computeAdjointRhsWithJoint(solution.H, target_group, group_cache);
+                    adjoint_rhs += computeAdjointRhsWithJoint(solution.H, target_group, shared_joint_cache, group_data);
                     const Eigen::VectorXd group_quadratic_rhs =
-                        computeQuadraticRhsWithJoint(solution.H, target_group, group_cache);
+                        computeQuadraticRhsWithJoint(solution.H, target_group, shared_joint_cache, group_data);
                     quadratic_rhs += group_quadratic_rhs;
 
-                    Eigen::VectorXd g_joint = group_cache.weighted_errors;
-                    constexpr int node_dim = 18;
+                    Eigen::VectorXd g_joint = group_data.weighted_errors;
                     for (int i = 0; i < static_cast<int>(target_group.size()); ++i)
                     {
-                        const Vector18d e = group_cache.node_errors_stacked.segment<18>(i * node_dim);
+                        const Vector18d e = group_data.node_errors_stacked.segment<18>(i * node_dim);
                         Matrix18d J = Matrix18d::Identity();
                         J.block<6, 6>(0, 0) = se3::vec2jacinv(e.segment<6>(0));
                         g_joint.segment<18>(i * node_dim) = J.transpose() * g_joint.segment<18>(i * node_dim);
                     }
                     g_joint_norm_sq_sum += g_joint.squaredNorm();
-                    q_joint_norm_sq_sum += group_cache.weighted_errors.squaredNorm();
+                    q_joint_norm_sq_sum += group_data.weighted_errors.squaredNorm();
 
-                    if (group_cache.effective_validation_count > 0)
+                    if (shared_joint_cache.effective_validation_count > 0)
                     {
-                        pv_min_eig_acc += group_cache.min_observed_cov_eig;
-                        pv_max_eig_acc += group_cache.max_observed_cov_eig;
-                        pv_condition_acc += group_cache.observed_cov_condition;
+                        pv_min_eig_acc += shared_joint_cache.min_observed_cov_eig;
+                        pv_max_eig_acc += shared_joint_cache.max_observed_cov_eig;
+                        pv_condition_acc += shared_joint_cache.observed_cov_condition;
                         have_cov_diag = true;
                     }
 
                     JointGroupLogDetData logdet_group;
-                    logdet_group.node_indices = group_cache.node_indices;
-                    logdet_group.joint_information = group_cache.joint_information;
-                    logdet_group.quadratic_state = adjoint_solver.solve(group_quadratic_rhs);
-                    if (adjoint_solver.info() != Eigen::Success)
+                    if (shared_joint_cache.full_state_observation)
                     {
-                        throw std::runtime_error("Optimizer::step failed to solve group quadratic sensitivity state.");
+                        logdet_group.quadratic_state = group_data.node_errors_stacked;
+                    }
+                    else
+                    {
+                        if (shared_joint_cache.joint_observations)
+                        {
+                            group_quadratic_rhs_list.push_back(group_quadratic_rhs);
+                        }
+                        else
+                        {
+                            const double target_scale = std::sqrt(static_cast<double>(target_group.size()));
+                            for (int target_index = 0; target_index < static_cast<int>(target_group.size()); ++target_index)
+                            {
+                                JointGroupLogDetData target_logdet;
+                                target_logdet.quadratic_state = Eigen::VectorXd::Zero(solution.H.rows());
+                                for (int dimension = 0; dimension < 18; ++dimension)
+                                {
+                                    const int column = shared_joint_cache.observed_columns[target_index][dimension];
+                                    if (column >= 0)
+                                    {
+                                        target_logdet.quadratic_state += shared_joint_cache.h_inv_selector.col(column) *
+                                            group_data.weighted_errors(target_index * 18 + dimension);
+                                    }
+                                }
+                                target_logdet.quadratic_state *= target_scale;
+                                joint_group_logdet_data.push_back(std::move(target_logdet));
+                            }
+                        }
                     }
 
-                    const int group_block_count = static_cast<int>(group_cache.node_indices.size());
-                    Eigen::MatrixXd rhs_logdet_group = Eigen::MatrixXd::Zero(solution.H.rows(), node_dim * group_block_count);
-                    for (int u = 0; u < group_block_count; ++u)
+                    if (shared_joint_cache.full_state_observation || shared_joint_cache.joint_observations)
                     {
-                        const int node_index = group_cache.node_indices[static_cast<std::size_t>(u)];
-                        rhs_logdet_group.block(node_index * node_dim, u * node_dim, node_dim, node_dim).setIdentity();
+                        joint_group_logdet_data.push_back(std::move(logdet_group));
                     }
-                    logdet_group.logdet_projection = adjoint_solver.solve(rhs_logdet_group);
+                }
+
+                if (!shared_joint_cache.full_state_observation && shared_joint_cache.joint_observations)
+                {
+                    const int group_count_int = static_cast<int>(group_quadratic_rhs_list.size());
+                    Eigen::MatrixXd group_quadratic_rhs_matrix = Eigen::MatrixXd::Zero(solution.H.rows(), group_count_int);
+                    for (int group_idx = 0; group_idx < group_count_int; ++group_idx)
+                    {
+                        group_quadratic_rhs_matrix.col(group_idx) = group_quadratic_rhs_list[static_cast<std::size_t>(group_idx)];
+                    }
+
+                    const auto t_group_quadratic_solve_start = std::chrono::steady_clock::now();
+                    const Eigen::MatrixXd group_quadratic_states = adjoint_solver.solve(group_quadratic_rhs_matrix);
+                    const auto t_group_quadratic_solve_end = std::chrono::steady_clock::now();
+                    adjoint_solves_ms += std::chrono::duration<double, std::milli>(
+                        t_group_quadratic_solve_end - t_group_quadratic_solve_start).count();
                     if (adjoint_solver.info() != Eigen::Success)
                     {
-                        throw std::runtime_error("Optimizer::step failed to solve group log-det sensitivity projection.");
+                        throw std::runtime_error("Optimizer::step failed to solve group quadratic sensitivity states.");
                     }
-                    joint_group_logdet_data.push_back(std::move(logdet_group));
+
+                    for (int group_idx = 0; group_idx < group_count_int; ++group_idx)
+                    {
+                        joint_group_logdet_data[static_cast<std::size_t>(group_idx)].quadratic_state =
+                            group_quadratic_states.col(group_idx);
+                    }
                 }
 
                 adjoint_rhs /= group_count;
@@ -2910,13 +4168,42 @@ namespace spacetime {
             result.psi = current_psi;
             result.lambda = lambda;
             result.theta = theta;
+            if (!optimizer_config.parameter_checkpoint_path.empty())
+            {
+                Json::Value checkpoint;
+                checkpoint["parameter_layout_version"] = 2;
+                checkpoint["parameter_layout"] = "P0(18),Q1(6),Q2(6),Q3(6),Q4(6)";
+                checkpoint["iterations"] = result.iterations;
+                checkpoint["loss"] = result.loss;
+                checkpoint["converged"] = false;
+                for (int index = 0; index < kThetaSize; ++index)
+                {
+                    checkpoint["theta"].append(theta(index));
+                    checkpoint["lambda"].append(lambda(index));
+                }
+                const auto temporary_path = optimizer_config.parameter_checkpoint_path + ".tmp";
+                std::ofstream checkpoint_stream(temporary_path);
+                if (!checkpoint_stream) throw std::runtime_error("Cannot write parameter checkpoint.");
+                writeReportJson(checkpoint_stream, checkpoint);
+                checkpoint_stream.close();
+                if (!checkpoint_stream) throw std::runtime_error("Failed to write parameter checkpoint.");
+                std::filesystem::rename(temporary_path, optimizer_config.parameter_checkpoint_path);
+            }
 
+            const auto t_adjoint_solve_start = std::chrono::steady_clock::now();
             const Eigen::VectorXd adjoint_lambda = adjoint_solver.solve(adjoint_rhs);
+            const auto t_adjoint_solve_end = std::chrono::steady_clock::now();
+            adjoint_solves_ms += std::chrono::duration<double, std::milli>(
+                t_adjoint_solve_end - t_adjoint_solve_start).count();
             if (adjoint_solver.info() != Eigen::Success)
             {
                 throw std::runtime_error("Optimizer::step failed to solve the adjoint system.");
             }
+            const auto t_quadratic_solve_start = std::chrono::steady_clock::now();
             const Eigen::VectorXd quadratic_state = adjoint_solver.solve(quadratic_rhs);
+            const auto t_quadratic_solve_end = std::chrono::steady_clock::now();
+            adjoint_solves_ms += std::chrono::duration<double, std::milli>(
+                t_quadratic_solve_end - t_quadratic_solve_start).count();
             if (adjoint_solver.info() != Eigen::Success)
             {
                 throw std::runtime_error("Optimizer::step failed to solve the quadratic sensitivity system.");
@@ -2933,7 +4220,11 @@ namespace spacetime {
                     const int node_index = logdet_node_indices[static_cast<std::size_t>(u)];
                     rhs_logdet.block(node_index * node_dim, u * node_dim, node_dim, node_dim).setIdentity();
                 }
+                const auto t_logdet_projection_solve_start = std::chrono::steady_clock::now();
                 logdet_projection = adjoint_solver.solve(rhs_logdet);
+                const auto t_logdet_projection_solve_end = std::chrono::steady_clock::now();
+                adjoint_solves_ms += std::chrono::duration<double, std::milli>(
+                    t_logdet_projection_solve_end - t_logdet_projection_solve_start).count();
                 if (adjoint_solver.info() != Eigen::Success)
                 {
                     throw std::runtime_error("Optimizer::step failed to solve for the log-det sensitivity projection.");
@@ -2960,10 +4251,11 @@ namespace spacetime {
                 }
             }
 
-            Eigen::VectorXd gradient_dL_dtheta = Eigen::VectorXd::Zero(kThetaSize);
+            Eigen::VectorXd gradient_dL_dtheta = direct_validation_gradient;
             FactorKernelSample unary_sample;
             FactorKernelSample time_sample;
             FactorKernelSample space_sample;
+            const auto t_factor_gradient_loop_start = std::chrono::steady_clock::now();
 
             // Compute the gradient contributions from each built-in factor type
             for (std::size_t i = 0; i < built_in_count; ++i)
@@ -3014,24 +4306,40 @@ namespace spacetime {
                 Eigen::MatrixXd Z_f = Eigen::MatrixXd::Zero(local_dim, local_dim);
                 if (use_joint_objective)
                 {
-                    for (const auto& group_logdet : joint_group_logdet_data)
+                    if (shared_joint_cache.full_state_observation)
                     {
-                        const int group_block_count = static_cast<int>(group_logdet.node_indices.size());
-                        Eigen::MatrixXd G_local_group = Eigen::MatrixXd::Zero(local_dim, node_dim * group_block_count);
-                        for (int u = 0; u < group_block_count; ++u)
+                        Eigen::MatrixXd rhs_local = Eigen::MatrixXd::Zero(solution.H.rows(), local_dim);
+                        for (std::size_t j = 0; j < lin.node_indices.size(); ++j)
                         {
-                            for (std::size_t j = 0; j < lin.node_indices.size(); ++j)
-                            {
-                                const int node_index = lin.node_indices[j];
-                                G_local_group.block(static_cast<int>(j) * node_dim, u * node_dim, node_dim, node_dim) =
-                                    group_logdet.logdet_projection.block(node_index * node_dim, u * node_dim, node_dim, node_dim);
-                            }
+                            const int node_index = lin.node_indices[j];
+                            rhs_local.block(node_index * node_dim, static_cast<int>(j) * node_dim, node_dim, node_dim).setIdentity();
                         }
-                        Z_f += G_local_group * group_logdet.joint_information * G_local_group.transpose();
+                        const Eigen::MatrixXd local_projection = adjoint_solver.solve(rhs_local);
+                        if (adjoint_solver.info() != Eigen::Success)
+                        {
+                            throw std::runtime_error("Optimizer::step failed to solve full-state local covariance projection.");
+                        }
+                        for (std::size_t j = 0; j < lin.node_indices.size(); ++j)
+                        {
+                            const int node_index = lin.node_indices[j];
+                            Z_f.block(static_cast<int>(j) * node_dim, 0, node_dim, local_dim) =
+                                local_projection.block(node_index * node_dim, 0, node_dim, local_dim);
+                        }
                     }
-                    if (!joint_group_logdet_data.empty())
+                    else
                     {
-                        Z_f /= static_cast<double>(joint_group_logdet_data.size());
+                        const int observed_dim = static_cast<int>(shared_joint_cache.observed_stacked_indices.size());
+                        Eigen::MatrixXd G_local_group = Eigen::MatrixXd::Zero(local_dim, observed_dim);
+                        Eigen::MatrixXd weighted_local_group(local_dim, observed_dim);
+                        for (std::size_t j = 0; j < lin.node_indices.size(); ++j)
+                        {
+                            const int node_index = lin.node_indices[j];
+                            G_local_group.block(static_cast<int>(j) * node_dim, 0, node_dim, observed_dim) =
+                                shared_joint_logdet_projection.block(node_index * node_dim, 0, node_dim, observed_dim);
+                            weighted_local_group.block(static_cast<int>(j) * node_dim, 0, node_dim, observed_dim) =
+                                shared_joint_weighted_projection.block(node_index * node_dim, 0, node_dim, observed_dim);
+                        }
+                        Z_f = weighted_local_group * G_local_group.transpose();
                     }
                 }
                 else
@@ -3093,9 +4401,6 @@ namespace spacetime {
                             lin.e, lin.Q, lin.E, adjoint_lambda_f, e_nodes, kNllQuadraticScale).dL_dtheta_info;
                     }
 
-                    std::cout << "Node index: " << lin.node_indices[0]
-                              << ", contrib.dL_dtheta_state: " << state_contrib.dL_dtheta_state.transpose()
-                              << ", contrib.dL_dtheta_info: " << info_gradient.transpose() << std::endl;
                     gradient_dL_dtheta.segment<18>(0) += state_contrib.dL_dtheta_state + info_gradient;
                     gradient_dL_dtheta.segment<18>(0) += computeUnaryLogDetGradientFromTrace(A_logdet);
                     continue;
@@ -3153,10 +4458,10 @@ namespace spacetime {
                     }
 
                     gradient_dL_dtheta.segment<6>(24) += state_contrib.dL_dtheta_state.segment<6>(0) + info_gradient.segment<6>(0); // Q2
-                    gradient_dL_dtheta.segment<6>(30) += state_contrib.dL_dtheta_state.segment<6>(6) + info_gradient.segment<6>(6); // Q3
+                    gradient_dL_dtheta.segment<6>(kQ4Offset) += state_contrib.dL_dtheta_state.segment<6>(6) + info_gradient.segment<6>(6);
                     const Eigen::VectorXd logdet_contrib = computeBinarySpaceLogDetGradientFromTrace(local_nodes, A_logdet);
                     gradient_dL_dtheta.segment<6>(24) += logdet_contrib.segment<6>(0);
-                    gradient_dL_dtheta.segment<6>(30) += logdet_contrib.segment<6>(6);
+                    gradient_dL_dtheta.segment<6>(kQ4Offset) += logdet_contrib.segment<6>(6);
                     continue;
                 }
 
@@ -3211,8 +4516,11 @@ namespace spacetime {
 
                 throw std::runtime_error("Optimizer::step: could not classify built-in binary factor as space or time from node coordinates.");
             }
+            const auto t_factor_gradient_loop_end = std::chrono::steady_clock::now();
+            factor_gradient_loop_ms = std::chrono::duration<double, std::milli>(
+                t_factor_gradient_loop_end - t_factor_gradient_loop_start).count();
 
-            if (optimizer_config.enable_gradient_fd_check)
+            if (optimizer_config.enable_gradient_fd_check && iter == 0 && scenario_index == 0)
             {
                 runVarianceFiniteDifferenceChecks(
                     theta,
@@ -3225,37 +4533,169 @@ namespace spacetime {
                     optimizer_config.enable_time_factor_fd_check,
                     optimizer_config.enable_space_factor_fd_check);
             }
-            const Eigen::VectorXd variance_gradient = gradient_dL_dtheta;
+                variance_gradient_sum += gradient_dL_dtheta;
+                if (solution.tip_metrics.translation_count > 0)
+                {
+                    tip_metric_sums.translation_mae += solution.tip_metrics.translation_mae;
+                    tip_metric_sums.translation_rmse += solution.tip_metrics.translation_rmse;
+                    ++tip_metric_sums.translation_count;
+                }
+                if (solution.tip_metrics.rotation_count > 0)
+                {
+                    tip_metric_sums.rotation_mae += solution.tip_metrics.rotation_mae;
+                    tip_metric_sums.rotation_rmse += solution.tip_metrics.rotation_rmse;
+                    ++tip_metric_sums.rotation_count;
+                }
+                if (solution.body_metrics.translation_count > 0)
+                {
+                    body_metric_sums.translation_mae += solution.body_metrics.translation_mae;
+                    body_metric_sums.translation_rmse += solution.body_metrics.translation_rmse;
+                    ++body_metric_sums.translation_count;
+                }
+                if (solution.body_metrics.rotation_count > 0)
+                {
+                    body_metric_sums.rotation_mae += solution.body_metrics.rotation_mae;
+                    body_metric_sums.rotation_rmse += solution.body_metrics.rotation_rmse;
+                    ++body_metric_sums.rotation_count;
+                }
+                averaged_validation.loss += validation.loss;
+                averaged_validation.mean_nees += validation.mean_nees;
+                averaged_validation.mean_logdet += validation.mean_logdet;
+                averaged_validation.mahalanobis_sum += validation.mahalanobis_sum;
+                averaged_validation.logdet_sum += validation.logdet_sum;
+                averaged_validation.delta += validation.delta;
+                g_joint_norm_sum += g_joint_norm;
+                q_joint_norm_sum += q_joint_norm;
+                adjoint_rhs_norm_sum += adjoint_rhs.norm();
+                quadratic_rhs_norm_sum += quadratic_rhs.norm();
+                adjoint_state_norm_sum += adjoint_lambda.norm();
+                quadratic_state_norm_sum += quadratic_state.norm();
+                pv_min_eig_sum += pv_min_eig;
+                pv_max_eig_sum += pv_max_eig;
+                pv_condition_sum += pv_condition;
+                joint_cache_ms_sum += joint_cache_ms;
+                joint_setup_ms_sum += shared_joint_cache.setup_ms;
+                joint_selector_ms_sum += shared_joint_cache.selector_ms;
+                joint_projection_solve_ms_sum += shared_joint_cache.projection_solve_ms;
+                joint_covariance_ms_sum += shared_joint_cache.covariance_ms;
+                joint_eigendecomposition_ms_sum += shared_joint_cache.eigendecomposition_ms;
+                joint_information_ms_sum += shared_joint_cache.information_ms;
+                adjoint_solves_ms_sum += adjoint_solves_ms;
+                factor_gradient_loop_ms_sum += factor_gradient_loop_ms;
+            }
+
+            const double scenario_count = static_cast<double>(scenario_problems_.size());
+            const double tip_mae = tip_metric_sums.translation_count > 0
+                ? tip_metric_sums.translation_mae / tip_metric_sums.translation_count
+                : std::numeric_limits<double>::quiet_NaN();
+            const double tip_rmse = tip_metric_sums.translation_count > 0
+                ? tip_metric_sums.translation_rmse / tip_metric_sums.translation_count
+                : std::numeric_limits<double>::quiet_NaN();
+            const double tip_rotation_mae = tip_metric_sums.rotation_count > 0
+                ? tip_metric_sums.rotation_mae / tip_metric_sums.rotation_count
+                : std::numeric_limits<double>::quiet_NaN();
+            const double tip_rotation_rmse = tip_metric_sums.rotation_count > 0
+                ? tip_metric_sums.rotation_rmse / tip_metric_sums.rotation_count
+                : std::numeric_limits<double>::quiet_NaN();
+            const double body_mae = body_metric_sums.translation_count > 0
+                ? body_metric_sums.translation_mae / body_metric_sums.translation_count
+                : std::numeric_limits<double>::quiet_NaN();
+            const double body_rmse = body_metric_sums.translation_count > 0
+                ? body_metric_sums.translation_rmse / body_metric_sums.translation_count
+                : std::numeric_limits<double>::quiet_NaN();
+            const double body_rotation_mae = body_metric_sums.rotation_count > 0
+                ? body_metric_sums.rotation_mae / body_metric_sums.rotation_count
+                : std::numeric_limits<double>::quiet_NaN();
+            const double body_rotation_rmse = body_metric_sums.rotation_count > 0
+                ? body_metric_sums.rotation_rmse / body_metric_sums.rotation_count
+                : std::numeric_limits<double>::quiet_NaN();
+            const Eigen::VectorXd variance_gradient = variance_gradient_sum / scenario_count;
+            averaged_validation.loss /= scenario_count;
+            averaged_validation.mean_nees /= scenario_count;
+            averaged_validation.mean_logdet /= scenario_count;
+            averaged_validation.mahalanobis_sum /= scenario_count;
+            averaged_validation.logdet_sum /= scenario_count;
+            averaged_validation.delta /= scenario_count;
+            const ValidationLossData& validation = averaged_validation;
+            result.loss = validation.loss;
+            result.iterations = iter + 1;
+            result.psi = current_psi;
+            result.lambda = lambda;
+            result.theta = theta;
+
             Eigen::VectorXd dL_dlambda = -variance_gradient.array() / lambda.array().square();
             Eigen::VectorXd dL_dpsi = optimizer_config.use_exponential_param
                 ? (dL_dlambda.array() * lambda.array()).matrix()
                 : dL_dlambda;
-            if (optimizer_config.freeze_p0_non_pose)
+            for (int index = 0; index < kThetaSize; ++index)
             {
-                dL_dlambda.segment<12>(6).setZero();
-                dL_dpsi.segment<12>(6).setZero();
+                if (update_mask[index] == 0)
+                {
+                    dL_dlambda(index) = 0.0;
+                    dL_dpsi(index) = 0.0;
+                }
             }
 
             const double grad_norm = dL_dpsi.norm();
             const double loss_change = std::abs(validation.loss - previous_loss);
-            const double adjoint_rhs_norm = adjoint_rhs.norm();
-            const double quadratic_rhs_norm = quadratic_rhs.norm();
-            const double adjoint_state_norm = adjoint_lambda.norm();
-            const double quadratic_state_norm = quadratic_state.norm();
-            const std::string objective_mode = use_joint_objective ? "joint" : "marginal";
+            const double g_joint_norm = g_joint_norm_sum / scenario_count;
+            const double q_joint_norm = q_joint_norm_sum / scenario_count;
+            const double adjoint_rhs_norm = adjoint_rhs_norm_sum / scenario_count;
+            const double quadratic_rhs_norm = quadratic_rhs_norm_sum / scenario_count;
+            const double adjoint_state_norm = adjoint_state_norm_sum / scenario_count;
+            const double quadratic_state_norm = quadratic_state_norm_sum / scenario_count;
+            const double pv_min_eig = pv_min_eig_sum / scenario_count;
+            const double pv_max_eig = pv_max_eig_sum / scenario_count;
+            const double pv_condition = pv_condition_sum / scenario_count;
+            const double lower_solve_ms = lower_solve_ms_sum / scenario_count;
+            const double extract_hessian_ms = extract_hessian_ms_sum / scenario_count;
+            const double joint_cache_ms = joint_cache_ms_sum / scenario_count;
+            const double adjoint_solves_ms = adjoint_solves_ms_sum / scenario_count;
+            const double factor_gradient_loop_ms = factor_gradient_loop_ms_sum / scenario_count;
+            const std::string objective_mode = optimizer_config.use_joint_validation_objective ? "joint" : "marginal";
             if (optimizer_config.verbose)
             {
                 std::cout << "Outer iteration " << iter
                           << ": loss=" << validation.loss
                           << ", mean_mahalanobis=" << validation.mean_nees
                           << ", mean_logdet=" << validation.mean_logdet
+                          << ", tip_mae_m=" << tip_mae
+                          << ", tip_rmse_m=" << tip_rmse
+                          << ", tip_rotation_mae_rad=" << tip_rotation_mae
+                          << ", tip_rotation_rmse_rad=" << tip_rotation_rmse
+                          << ", body_mae_m=" << body_mae
+                          << ", body_rmse_m=" << body_rmse
+                          << ", body_rotation_mae_rad=" << body_rotation_mae
+                          << ", body_rotation_rmse_rad=" << body_rotation_rmse
                           << ", grad_norm=" << grad_norm
+                          << ", minimum_learning_rate=" << effective_learning_rates.minCoeff()
                           << ", lambda_min=" << lambda.minCoeff()
                           << ", lambda_max=" << lambda.maxCoeff()
                           << ", theta_min=" << theta.minCoeff()
                           << ", theta_max=" << theta.maxCoeff()
                           << ", objective_mode=" << objective_mode
                           << std::endl;
+                std::cout << "Timing breakdown (ms): lower_solve_ms=" << lower_solve_ms
+                          << ", extract_hessian_ms=" << extract_hessian_ms
+                          << ", joint_cache_ms=" << joint_cache_ms
+                          << ", adjoint_solves_ms=" << adjoint_solves_ms
+                          << ", factor_gradient_loop_ms=" << factor_gradient_loop_ms
+                          << std::endl;
+                if (optimizer_config.use_joint_validation_objective)
+                {
+                    const double joint_phase_ms_sum = joint_setup_ms_sum + joint_selector_ms_sum +
+                        joint_projection_solve_ms_sum + joint_covariance_ms_sum +
+                        joint_eigendecomposition_ms_sum + joint_information_ms_sum;
+                    std::cout << "Joint cache timing breakdown (ms, per-scenario mean): setup_ms="
+                              << joint_setup_ms_sum / scenario_count
+                              << ", selector_ms=" << joint_selector_ms_sum / scenario_count
+                              << ", projection_solve_ms=" << joint_projection_solve_ms_sum / scenario_count
+                              << ", covariance_ms=" << joint_covariance_ms_sum / scenario_count
+                              << ", eigendecomposition_ms=" << joint_eigendecomposition_ms_sum / scenario_count
+                              << ", information_ms=" << joint_information_ms_sum / scenario_count
+                              << ", other_ms=" << (joint_cache_ms_sum - joint_phase_ms_sum) / scenario_count
+                              << std::endl;
+                }
                 if (optimizer_config.log_joint_diagnostics)
                 {
                     std::cout << "Path diagnostics: g_joint_norm=" << g_joint_norm
@@ -3281,17 +4721,14 @@ namespace spacetime {
                 outer_loop_log << ',' << dL_dlambda[i];
             }
             outer_loop_log << ',' << validation.mean_nees << ',' << validation.mean_logdet << ',' << validation.loss
-                          << ',' << objective_mode
-                          << ',' << g_joint_norm
-                          << ',' << q_joint_norm
-                          << ',' << adjoint_rhs_norm
-                          << ',' << quadratic_rhs_norm
-                          << ',' << adjoint_state_norm
-                          << ',' << quadratic_state_norm
-                          << ',' << pv_min_eig
-                          << ',' << pv_max_eig
-                          << ',' << pv_condition
-                          << '\n';
+                           << ',' << tip_mae << ',' << tip_rmse << ',' << tip_rotation_mae << ',' << tip_rotation_rmse
+                           << ',' << body_mae << ',' << body_rmse << ',' << body_rotation_mae << ',' << body_rotation_rmse
+                           << ',' << effective_learning_rates.minCoeff() << ',' << oscillation_reductions;
+            for (int index = 0; index < kThetaSize; ++index)
+            {
+                outer_loop_log << ',' << effective_learning_rates(index) << ',' << dimension_reductions[index];
+            }
+            outer_loop_log << '\n';
             if (grad_norm < optimizer_config.tol_grad ||
                 (iter > 0 && loss_change < optimizer_config.tol_loss))
             {
@@ -3328,7 +4765,7 @@ namespace spacetime {
                 }
             }
 
-            Eigen::VectorXd delta_psi = -optimizer_config.learning_rate * update_direction;
+            Eigen::VectorXd delta_psi = -(effective_learning_rates.array() * update_direction.array()).matrix();
             const double delta_psi_norm = delta_psi.norm();
             if (std::isfinite(delta_psi_norm) && optimizer_config.max_psi_step_norm > 0.0 &&
                 delta_psi_norm > optimizer_config.max_psi_step_norm)
@@ -3342,7 +4779,9 @@ namespace spacetime {
                 }
             }
 
+            const Eigen::VectorXd previous_psi = current_psi;
             current_psi += delta_psi;
+            const Eigen::VectorXd requested_psi = current_psi;
 
             if (optimizer_config.use_exponential_param)
             {
@@ -3351,6 +4790,37 @@ namespace spacetime {
                 const double min_psi = std::log(min_lambda);
                 const double max_psi = std::log(max_lambda);
                 current_psi = current_psi.array().max(min_psi).min(max_psi).matrix();
+            }
+            for (int index = 0; index < kThetaSize; ++index)
+            {
+                if (update_mask[index] == 0)
+                {
+                    current_psi(index) = initial_psi(index);
+                }
+            }
+            if (optimizer_config.enable_oscillation_detection)
+            {
+                std::vector<int> eligible = update_mask;
+                for (int index = 0; index < kThetaSize; ++index)
+                {
+                    if (current_psi(index) != requested_psi(index))
+                    {
+                        eligible[index] = 0;
+                    }
+                }
+                const auto detected_dimensions = oscillation_detector.observe(current_psi - previous_psi, eligible);
+                for (const int dimension : detected_dimensions)
+                {
+                    const double previous_rate = effective_learning_rates(dimension);
+                    effective_learning_rates(dimension) = oscillation_detector.reducedLearningRate(
+                        dimension, previous_rate, std::abs(update_direction(dimension)));
+                    ++oscillation_reductions;
+                    ++dimension_reductions[dimension];
+                    std::cout << "Persistent step oscillation at outer iteration " << iter
+                              << ": dimension=" << dimension << ", learning_rate=" << previous_rate
+                              << " -> " << effective_learning_rates(dimension)
+                              << ", cooldown_updates=15" << std::endl;
+                }
             }
         }
 
@@ -3367,7 +4837,7 @@ namespace spacetime {
             validation_precision(i) = (v > 0.0) ? (1.0 / v) : 0.0;
         }
         outer_loop_log << "\nrun_summary\n";
-        outer_loop_log << "N,K,tol_grad,tol_loss,learning_rate,R_pose,R_gyro,validation_sample_count,validation_precision,objective_mode,converged\n";
+        outer_loop_log << "N,K,tol_grad,tol_loss,learning_rate,R_pose,R_gyro,validation_sample_count,validation_precision,objective_mode,converged,enable_oscillation_detection,final_learning_rate,oscillation_reductions,final_learning_rates,dimension_reductions\n";
         outer_loop_log << problem_->robotTopology().N << ','
                        << problem_->robotTopology().K << ','
                        << optimizer_config.tol_grad << ','
@@ -3378,7 +4848,16 @@ namespace spacetime {
                        << summary.validation_sample_count << ','
                        << '"' << formatVector(validation_precision) << '"' << ','
                    << (optimizer_config.use_joint_validation_objective ? "joint" : "marginal") << ','
-                       << (result.converged ? "true" : "false") << '\n';
+                       << (result.converged ? "true" : "false") << ','
+                       << (optimizer_config.enable_oscillation_detection ? "true" : "false") << ','
+                       << effective_learning_rates.minCoeff() << ',' << oscillation_reductions << ','
+                       << '"' << formatVector(effective_learning_rates) << '"' << ',' << '"';
+        for (int index = 0; index < kThetaSize; ++index)
+        {
+            if (index > 0) outer_loop_log << ',';
+            outer_loop_log << dimension_reductions[index];
+        }
+        outer_loop_log << '"' << '\n';
         return result;
     }
 
@@ -3395,10 +4874,30 @@ namespace spacetime {
 
 }
 
-int TestLower()
+int TestLower(bool physical_data)
 {
     std::cout << "Lower-level optimizer test" << std::endl;
-    const TestProblemData data = buildMinimalTestProblemData();
+    const TestProblemData data = buildMinimalTestProblemData(physical_data);
+
+    if (physical_data)
+    {
+        for (std::size_t scenario_index = 0; scenario_index < data.measurement_scenarios.size(); ++scenario_index)
+        {
+            const auto& scenario = data.measurement_scenarios[scenario_index];
+            spacetime::OptimizationProblem scenario_problem;
+            scenario_problem.setEstimatorOptions(data.estimator_options);
+            scenario_problem.setRobotTopology(scenario.robot_topology);
+            scenario_problem.setTheta(data.initial_theta);
+            scenario_problem.setProblemData(scenario.nodes, scenario.factors, scenario.factor_node_indices);
+            const auto scenario_result = scenario_problem.solveLowerLevel(false);
+            std::cout << "Physical scenario " << scenario_index
+                      << " solved: H=" << scenario_result.H.rows() << 'x' << scenario_result.H.cols()
+                      << ", dx_norm=" << scenario_result.x.norm()
+                      << ", linearizations=" << scenario_result.linearizations.size()
+                      << std::endl;
+        }
+        return 0;
+    }
 
     spacetime::OptimizationProblem problem;
     problem.setEstimatorOptions(data.estimator_options);
@@ -3428,18 +4927,70 @@ int TestLower()
 
 int main(int argc, char** argv)
 {
-    if (argc > 1)
+    bool run_lower = false;
+    bool physical_data = false;
+    bool inspect_data = false;
+    int max_outer_iterations_override = -1;
+    int max_scenarios_override = -1;
+    std::string evaluation_parameters_path;
+    for (int arg_index = 1; arg_index < argc; ++arg_index)
     {
-        const std::string mode = argv[1];
+        const std::string mode = argv[arg_index];
         if (mode == "--lower")
         {
-            return TestLower();
+            run_lower = true;
         }
+        else if (mode == "--physical")
+        {
+            physical_data = true;
+        }
+        else if (mode == "--inspect")
+        {
+            inspect_data = true;
+        }
+        else if (mode == "--max-outer-iterations")
+        {
+            if (arg_index + 1 >= argc)
+            {
+                throw std::runtime_error("--max-outer-iterations requires a positive integer value.");
+            }
+            max_outer_iterations_override = std::stoi(argv[++arg_index]);
+            if (max_outer_iterations_override <= 0)
+            {
+                throw std::runtime_error("--max-outer-iterations requires a positive integer value.");
+            }
+        }
+        else if (mode == "--max-scenarios")
+        {
+            if (arg_index + 1 >= argc)
+            {
+                throw std::runtime_error("--max-scenarios requires a positive integer value.");
+            }
+            max_scenarios_override = std::stoi(argv[++arg_index]);
+            if (max_scenarios_override <= 0)
+            {
+                throw std::runtime_error("--max-scenarios requires a positive integer value.");
+            }
+        }
+        else if (mode == "--evaluate-parameters")
+        {
+            if (arg_index + 1 >= argc)
+            {
+                throw std::runtime_error("--evaluate-parameters requires a saved parameter JSON path.");
+            }
+            evaluation_parameters_path = argv[++arg_index];
+        }
+        else
+        {
+            throw std::runtime_error("Unknown argument: " + mode + ". Supported arguments are --lower, --physical, --inspect, --max-outer-iterations N, --max-scenarios N, and --evaluate-parameters FILE.");
+        }
+    }
+    if (run_lower)
+    {
+        return TestLower(physical_data);
     }
 
     std::cout << "Upper-level optimizer test" << std::endl;
-
-    const TestProblemData data = buildMinimalTestProblemData();
 
     const std::filesystem::path bilevel_config_path = resolveExistingPath({
         "assets/config/bilevel_optimizer/bilevel_config.json",
@@ -3447,6 +4998,95 @@ int main(int argc, char** argv)
         "../../assets/config/bilevel_optimizer/bilevel_config.json"
     });
     const Json::Value bilevel_config = loadJsonFile(bilevel_config_path);
+    std::vector<std::string> training_trials;
+    if (physical_data && bilevel_config.isMember("physical_training_trials"))
+    {
+        const auto& trials = bilevel_config["physical_training_trials"];
+        if (!trials.isArray() || trials.empty())
+        {
+            throw std::runtime_error("physical_training_trials must be a nonempty array of trial config paths.");
+        }
+        for (const auto& trial : trials)
+        {
+            if (!trial.isString() || trial.asString().empty())
+            {
+                throw std::runtime_error("physical_training_trials entries must be nonempty strings.");
+            }
+            training_trials.push_back(trial.asString());
+        }
+    }
+    const double common_window_duration = bilevel_config.get("physical_window_duration", -1.0).asDouble();
+    const int common_window_count = bilevel_config.get("measurement_sample_count", -1).asInt();
+    std::vector<std::string> testing_trials;
+    if (physical_data && bilevel_config.isMember("physical_testing_trials"))
+    {
+        const auto& trials = bilevel_config["physical_testing_trials"];
+        if (!trials.isArray()) throw std::runtime_error("physical_testing_trials must be an array.");
+        for (const auto& trial : trials)
+        {
+            if (!trial.isString() || trial.asString().empty())
+                throw std::runtime_error("physical_testing_trials entries must be nonempty strings.");
+            const auto trial_path = std::filesystem::weakly_canonical(trial.asString());
+            for (const auto& training_trial : training_trials)
+            {
+                if (trial_path == std::filesystem::weakly_canonical(training_trial))
+                    throw std::runtime_error("A physical trial cannot belong to both training and testing splits.");
+            }
+            testing_trials.push_back(trial.asString());
+        }
+    }
+    if (!evaluation_parameters_path.empty() && (!physical_data || training_trials.empty()))
+        throw std::runtime_error("--evaluate-parameters requires --physical and physical_training_trials.");
+    TestProblemData data = training_trials.empty()
+        ? buildMinimalTestProblemData(physical_data)
+        : buildMinimalTestProblemData(true, training_trials.front(), common_window_duration, common_window_count);
+    std::vector<std::pair<std::string, std::size_t>> training_ranges;
+    if (!training_trials.empty())
+    {
+        training_ranges.push_back({training_trials.front(), data.measurement_scenarios.size()});
+        for (std::size_t index = 1; index < training_trials.size(); ++index)
+        {
+            auto trial_data = buildMinimalTestProblemData(true, training_trials[index], common_window_duration, common_window_count);
+            training_ranges.push_back({training_trials[index], trial_data.measurement_scenarios.size()});
+            data.measurement_scenarios.insert(data.measurement_scenarios.end(),
+                std::make_move_iterator(trial_data.measurement_scenarios.begin()),
+                std::make_move_iterator(trial_data.measurement_scenarios.end()));
+        }
+        data.validation_sample_count = static_cast<int>(data.measurement_scenarios.size());
+    }
+    if (max_scenarios_override > 0 &&
+        data.measurement_scenarios.size() > static_cast<std::size_t>(max_scenarios_override))
+    {
+        data.measurement_scenarios.resize(static_cast<std::size_t>(max_scenarios_override));
+        data.validation_sample_count = max_scenarios_override;
+        std::size_t remaining = data.measurement_scenarios.size();
+        for (auto& range : training_ranges)
+        {
+            range.second = std::min(range.second, remaining);
+            remaining -= range.second;
+        }
+    }
+    if (inspect_data)
+    {
+        for (std::size_t index = 0; index < data.measurement_scenarios.size(); ++index)
+        {
+            const auto& scenario = data.measurement_scenarios[index];
+            std::cout << "Scenario " << index
+                      << ": N=" << scenario.robot_topology.N
+                      << ", K=" << scenario.robot_topology.K
+                      << ", T=" << scenario.robot_topology.T
+                      << ", nodes=" << scenario.nodes.size()
+                      << ", measurements=" << scenario.factors.size()
+                      << ", validation_targets=" << scenario.validation_targets.size()
+                      << std::endl;
+        }
+        for (const auto& trial : testing_trials)
+        {
+            const auto testing_data = buildMinimalTestProblemData(true, trial, common_window_duration, common_window_count);
+            std::cout << "Testing trial " << trial << ": windows=" << testing_data.measurement_scenarios.size() << std::endl;
+        }
+        return 0;
+    }
 
     spacetime::OptimizationProblem problem;
     problem.setEstimatorOptions(data.estimator_options);
@@ -3457,16 +5097,120 @@ int main(int argc, char** argv)
     problem.setValidationTargets(data.validation_targets);
 
     spacetime::Optimizer optimizer(problem);
+    if (!data.measurement_scenarios.empty())
+    {
+        std::vector<spacetime::OptimizationProblem> scenario_problems;
+        scenario_problems.reserve(data.measurement_scenarios.size());
+        for (const auto& scenario : data.measurement_scenarios)
+        {
+            spacetime::OptimizationProblem scenario_problem;
+            scenario_problem.setEstimatorOptions(data.estimator_options);
+            scenario_problem.setRobotTopology(scenario.robot_topology);
+            scenario_problem.setRunSummary({data.validation_sample_count, data.R_pose, data.R_gyro, data.validation_variance});
+            scenario_problem.setTheta(data.initial_theta);
+            scenario_problem.setProblemData(scenario.nodes, scenario.factors, scenario.factor_node_indices);
+            scenario_problem.setValidationTargets(scenario.validation_targets);
+            scenario_problems.push_back(std::move(scenario_problem));
+        }
+        optimizer.setScenarioProblems(scenario_problems);
+    }
     spacetime::Optimizer::OptimizerConfig config;
     loadBilevelOptimizerConfigFromJson(bilevel_config, config);
+    if (max_outer_iterations_override > 0)
+    {
+        config.max_iterations = max_outer_iterations_override;
+    }
+    std::filesystem::path output_dir;
+    if (!training_trials.empty())
+    {
+        output_dir = resolveAssetsLogPath("shared_physical_" + formatTimestamp());
+        std::filesystem::create_directories(output_dir);
+        config.parameter_checkpoint_path = (output_dir / "checkpoint.json").string();
+        Json::Value experiment;
+        experiment["bilevel_config"] = bilevel_config;
+        experiment["max_iterations"] = config.max_iterations;
+        experiment["max_scenarios_override"] = max_scenarios_override;
+        experiment["evaluation_parameters_path"] = evaluation_parameters_path;
+        experiment["robot_config"] = loadJsonFile(resolveExistingPath({
+            "assets/config/robot/robot1.json", "../assets/config/robot/robot1.json", "../../assets/config/robot/robot1.json"}));
+        experiment["estimator_config"] = loadJsonFile(resolveExistingPath({
+            "assets/config/estimator/batch.json", "../assets/config/estimator/batch.json", "../../assets/config/estimator/batch.json"}));
+        for (const auto& trial : training_trials) experiment["trial_configs"][trial] = loadJsonFile(trial);
+        for (const auto& trial : testing_trials) experiment["trial_configs"][trial] = loadJsonFile(trial);
+        std::ofstream manifest(output_dir / "experiment.json");
+        if (!manifest) throw std::runtime_error("Cannot write shared experiment manifest.");
+        writeReportJson(manifest, experiment);
+        std::cout << "Shared experiment output directory: " << output_dir << std::endl;
+    }
     optimizer.setConfig(config);
 
-    const spacetime::Optimizer::Result result = optimizer.optimize();
+    spacetime::Optimizer::Result result;
+    if (evaluation_parameters_path.empty())
+    {
+        result = optimizer.optimize();
+    }
+    else
+    {
+        result.theta = loadSavedTheta(evaluation_parameters_path);
+        result.lambda = result.theta.cwiseInverse();
+    }
     std::cout << "Upper-level optimization finished" << std::endl;
     std::cout << "Converged: " << (result.converged ? "true" : "false") << std::endl;
     std::cout << "Iterations: " << result.iterations << std::endl;
     std::cout << "Final loss: " << result.loss << std::endl;
     std::cout << "Lambda min/max: " << result.lambda.minCoeff() << " / " << result.lambda.maxCoeff() << std::endl;
+
+    if (!training_trials.empty())
+    {
+        Json::Value saved;
+        saved["parameter_layout_version"] = 2;
+        saved["parameter_layout"] = "P0(18),Q1(6),Q2(6),Q3(6),Q4(6)";
+        saved["config"] = bilevel_config;
+        saved["iterations"] = result.iterations;
+        saved["converged"] = result.converged;
+        saved["evaluation_only"] = !evaluation_parameters_path.empty();
+        saved["nll_convention"] = "0.5*(mahalanobis+logdet), Gaussian constant omitted";
+        saved["metric_convention"] = "All Vicon pose targets including base; translation norm in m, rotation angle in rad; pooled across overlapping windows";
+        for (int index = 0; index < kThetaSize; ++index)
+        {
+            saved["theta"].append(result.theta(index));
+            saved["lambda"].append(result.lambda(index));
+        }
+        for (const auto& trial : training_trials) saved["trial_configs"][trial] = loadJsonFile(trial);
+        for (const auto& trial : testing_trials) saved["trial_configs"][trial] = loadJsonFile(trial);
+        std::ofstream parameters(output_dir / "parameters.json");
+        if (!parameters) throw std::runtime_error("Cannot write shared-fit parameters.");
+        writeReportJson(parameters, saved);
+        parameters.close();
+        std::ofstream windows_log(output_dir / "window_metrics.csv");
+        std::ofstream summary_log(output_dir / "split_metrics.csv");
+        if (!windows_log || !summary_log) throw std::runtime_error("Cannot write shared-fit metrics.");
+        windows_log << std::setprecision(17);
+        summary_log << std::setprecision(17);
+        const std::string header = "split,trial,window,start_time,end_time,windows,targets,observed_dimensions,nll_sum,nll_mean_window,nll_per_dimension,mean_nees,translation_mae_m,translation_rmse_m,rotation_mae_rad,rotation_rmse_rad\n";
+        windows_log << header;
+        summary_log << header;
+        std::size_t begin = 0;
+        PhysicalEvaluationTotals training_totals;
+        for (const auto& range : training_ranges)
+        {
+            if (range.second > 0)
+                training_totals.add(evaluatePhysicalWindows(data, begin, range.second, result.theta,
+                    config.use_joint_validation_objective, "training", range.first, windows_log, summary_log));
+            begin += range.second;
+        }
+        writePhysicalEvaluationRow(summary_log, "training", "all", "all", 0.0, 0.0, training_totals);
+        PhysicalEvaluationTotals testing_totals;
+        for (const auto& trial : testing_trials)
+        {
+            const auto testing_data = buildMinimalTestProblemData(true, trial, common_window_duration, common_window_count);
+            testing_totals.add(evaluatePhysicalWindows(testing_data, 0, testing_data.measurement_scenarios.size(),
+                result.theta, config.use_joint_validation_objective, "testing", trial, windows_log, summary_log));
+        }
+        if (testing_totals.windows > 0)
+            writePhysicalEvaluationRow(summary_log, "testing", "all", "all", 0.0, 0.0, testing_totals);
+        std::cout << "Shared-fit parameters and frozen training/testing metrics: " << output_dir << std::endl;
+    }
 
     return 0;
 }

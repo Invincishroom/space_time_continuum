@@ -1,30 +1,72 @@
 // Simulated extensible robot from OpenCR project
 {
-    "weights": {
+    "options": {
+        "estimator": "batch", 
+        "log": 2,  
+        "interpolate_measurements": true, 
+        "compute_covariances": true
+    },
+    "optimizer": {
+        "convergence_threshold": 1, 
+        "max_iterations": 13,
+        "line_search": false, 
+        "kirchoff": false,
+        "LM_damping": 0,
+        "use_autodiff": false
+    },
+    "visualizer": {
+        "robot": {
+            "show_interpolation": true, 
+            "show_covariances": false, 
+            "show_frames": false
+        },
+        "measurements": {
+            "vicon": {
+                "show": false, 
+                "count": 5, 
+                "size": 2
+            },
+            "aurora": {
+                "show": false, 
+                "count": 2, 
+                "size": 2
+            }
+        },
+        "show_ground_plane": true,
+        "show_timeline": false,
+        "cameras": [{
+            "position": [0, 1, 0.233],
+            "look_at": [0, 0, 0.233],
+            "up": [0, 0, -1]
+        }]
+    },
+"weights": {
         "P0": [
-            8e-8, 8e-8, 8e-8, 1e-4, 1e-4, 1e-4, 
-            1e-3, 1e-3, 1e6, 1e2, 1e2, 1e-5, 
-            1e1, 1e1, 1e1, 1e1, 1e1, 1e1
+            8e-5, 8e-5, 8e-5, 1e-2, 1e-2, 1e-2, 
+            1e-2, 1e-2, 1e-2, 1e2, 1e2, 1e-2, 
+            1e-2, 1e-2, 1e-2, 1e-2, 1e-2, 1e-2
         ],
-        "Q1": [3e-1, 3e-1, 3e-1, 5e0, 5e0, 5e0], // varpi time -- lower linear = lower bubbling and high freq filter 
-        "Q2": [8e-3, 8e-3, 8e-3, 1e2, 1e2, 1e2], // epsilon space
-        "Q3": [3e0, 3e0, 3e0, 3e0, 3e0, 3e0], // epsilon time
-        "prior_factor": 5, 
-        "R_pose": [1e-5, 1e-5, 1e-5, 2.5e-4, 2.5e-4, 2.5e-4],
-        "R_gyro": [1e-5, 1e-5, 1e-5],
+        "Q1": [3e0, 3e0, 3e0, 3e2, 3e2, 3e2], // varpi time -- lower linear = lower bubbling and high freq filter 
+        "Q2": [8e-1, 8e-1, 8e-1, 5e2, 5e2, 5e2], // epsilon space
+        "Q3": [3e1, 3e1, 3e1, 3e3, 3e3, 3e2], // epsilon time
+        "Q4": [3e1, 3e1, 3e1, 5e1, 5e1, 5e1], // varpi space
+        "prior_factor": 0.5, 
+        "R_pose": [3e-5, 3e-5, 3e-5, 2.5e-3, 2.5e-3, 2.5e-3],
+        "R_gyro": [1e-4, 1e-4, 1e-4],
         "measurement_factor": 1
     },
     "topology": {
-        "N": 19, 
-        "K_per_second": 30, // 30Hz
-        "Ms": 1, 
+        "N": 5, 
+        "K_per_second": 30,
+        "Ms": 5, 
         "Mt": 1, 
-        "length": 1,
+        "length": 0.466,
         "radius": 0.002,
+        "time": 0,
         "lock_first_position": false,
         "lock_first_pose": false,
         "lock_last_strain": false,
         "time_nodes_on_measurements": false,
         "use_1D_estimator": false
     }
-}
+} 

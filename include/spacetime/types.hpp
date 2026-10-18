@@ -66,6 +66,7 @@ namespace Spacetime
         Eigen::Matrix<double, 6, 6> Q1;
         Eigen::Matrix<double, 6, 6> Q2;
         Eigen::Matrix<double, 6, 6> Q3;
+        Eigen::Matrix<double, 6, 6> Q4 = Eigen::Matrix<double, 6, 6>::Zero();
 
         void print() const
         {
@@ -74,6 +75,7 @@ namespace Spacetime
             std::cout << "Q1: \n" << Q1 << std::endl;
             std::cout << "Q2: \n" << Q2 << std::endl;
             std::cout << "Q3: \n" << Q3 << std::endl;
+            std::cout << "Q4: \n" << Q4 << std::endl;
         }
     };
 

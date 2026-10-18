@@ -16,12 +16,27 @@ struct LinearizationData {
     std::vector<int> node_indices; // global node indices for this factor
 };
 
+struct PoseValidationMetrics {
+    double translation_mae = 0.0;
+    double translation_rmse = 0.0;
+    double rotation_mae = 0.0;
+    double rotation_rmse = 0.0;
+    std::size_t translation_count = 0;
+    std::size_t rotation_count = 0;
+};
+
+using TipValidationMetrics = PoseValidationMetrics;
+
 // Container for data produced by a lower-level solve.
 struct LowerLevelSolution {
     Eigen::VectorXd x;            // stacked perturbation vector x*
     Eigen::SparseMatrix<double> H; // information matrix (H)
     // Per-factor linearisation data: e_f, E_f, Q_f (copies)
     std::vector<LinearizationData> linearizations;
+    TipValidationMetrics tip_metrics;
+    PoseValidationMetrics body_metrics;
+    double lower_solve_ms = 0.0;
+    double extract_hessian_ms = 0.0;
 };
 
 struct ValidationTarget {
@@ -29,6 +44,7 @@ struct ValidationTarget {
     int sample_group_id = 0;
     Spacetime::SystemState<DTYPE>::Node ground_truth;
     Eigen::Matrix<int, 18, 1> observed_mask = Eigen::Matrix<int, 18, 1>::Ones();
+    bool interpolate_time = false;
 };
 
 struct ValidationLossData {
@@ -55,8 +71,9 @@ public:
     using Node = Spacetime::SystemState<DTYPE>::Node;
 
     OptimizationProblem();
+    static constexpr int ParameterCount = 42;
 
-    // Set the noise parameter vector theta in the order [diag(P0), diag(Q1), diag(Q2), diag(Q3)].
+    // Set the noise parameter vector theta in the order [diag(P0), diag(Q1), diag(Q2), diag(Q3), diag(Q4)].
     void setTheta(const Eigen::VectorXd& theta);
 
     // Set the current factor graph and the node indices touched by each factor.
@@ -70,7 +87,7 @@ public:
     // Set robot topology loaded externally (e.g. from config/robot/minimal.json and trial initial conditions).
     void setRobotTopology(const Spacetime::RobotTopology &topology);
 
-    // Assemble and cache P0/Q1/Q2/Q3 from the current theta.
+    // Assemble and cache P0/Q1/Q2/Q3/Q4 from the current theta.
     void assembleFromTheta();
 
     // Solve the lower-level Gauss-Newton problem. Returns x*, H and linearisation data.
@@ -106,6 +123,7 @@ private:
     std::vector<std::shared_ptr<Spacetime::Factors::Factor>> factors_;
     std::vector<std::vector<int>> factor_node_indices_;
     std::vector<Node> solved_nodes_;
+    bool has_lower_solution_ = false;
     std::vector<ValidationTarget> validation_targets_;
     RunSummary run_summary_;
     bool run_summary_set_ = false;

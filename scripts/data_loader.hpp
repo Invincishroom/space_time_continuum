@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <sstream>
+#include <cmath>
 
 #include <Eigen/Core>
 #include <Eigen/SparseCholesky>
@@ -183,13 +184,38 @@ bool loadConfig(std::string filename, Spacetime::RobotTopology &topology, Spacet
         double prior_factor = 1.0;
         safeRead(weights_root, "prior_factor", prior_factor);
 
-        Eigen::Matrix<double, 6, 1> Q1, Q2, Q3;
+        Eigen::Matrix<double, 6, 1> Q1, Q2, Q3, Q4;
         loadArrayData(weights_root, "Q1", Q1);
         loadArrayData(weights_root, "Q2", Q2);
         loadArrayData(weights_root, "Q3", Q3);
+        Q4 = Q3;
+        if (weights_root.isMember("Q4"))
+        {
+            const Json::Value &values = weights_root["Q4"];
+            if (!values.isArray() || values.size() != 6)
+                throw std::runtime_error("Robot weights Q4 must be an array of six positive variances.");
+            if ((weights_root.isMember("prior_factor") && !weights_root["prior_factor"].isNumeric()) ||
+                !std::isfinite(prior_factor) || prior_factor <= 0.0)
+                throw std::runtime_error("Q4 prior_factor must be finite and strictly positive.");
+            for (unsigned int index = 0; index < 6; ++index)
+            {
+                if (!values[index].isNumeric())
+                    throw std::runtime_error("Robot weights Q4 entries must be numeric.");
+                const double variance = prior_factor * values[index].asDouble();
+                if (!std::isfinite(variance) || variance <= 0.0)
+                    throw std::runtime_error("Scaled Q4 variances must be finite and strictly positive.");
+            }
+            loadArrayData(weights_root, "Q4", Q4);
+        }
+        else
+        {
+            info("Q4 omitted; using Q3 for legacy spatial velocity noise.");
+        }
         params.Q1 = prior_factor * Q1.asDiagonal();
         params.Q2 = prior_factor * Q2.asDiagonal();
         params.Q3 = prior_factor * Q3.asDiagonal();
+        params.Q4 = prior_factor * Q4.asDiagonal();
+        info() << "Spatial velocity noise Q4: " << params.Q4.diagonal().transpose();
 
         Eigen::Matrix<double, 18, 1> P0;
         loadArrayData(weights_root, "P0", P0);

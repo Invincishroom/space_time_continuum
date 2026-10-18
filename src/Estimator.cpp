@@ -29,7 +29,7 @@ namespace Spacetime
 
         m_unary_factor = new Factors::UnaryFactor(m_hyperparameters.P0, m_node0);
         m_binary_time_factor = new Factors::BinaryTimeFactor(m_hyperparameters.Q1, m_hyperparameters.Q3);
-        m_binary_space_factor = new Factors::BinarySpaceFactor(m_hyperparameters.Q2, m_hyperparameters.Q3);
+        m_binary_space_factor = new Factors::BinarySpaceFactor(m_hyperparameters.Q2, m_hyperparameters.Q4);
         if (!m_robot_topology.time_nodes_on_measurements)
             m_state = constructInitialGuess(m_options.init_guess_type, {}, topology.t0);
     }
@@ -55,6 +55,10 @@ namespace Spacetime
 
     void Estimator::setHyperparameters(Hyperparameters parameters)
     {
+        if (parameters.Q4.isZero(0.0))
+        {
+            parameters.Q4 = parameters.Q3;
+        }
         // Asserts for inputs to make sure they are valid
         validateHyperparameters(parameters);
         m_hyperparameters = parameters;
@@ -98,6 +102,7 @@ namespace Spacetime
         validateDiagonalMatrix(parameters.Q1);
         validateDiagonalMatrix(parameters.Q2);
         validateDiagonalMatrix(parameters.Q3);
+        validateDiagonalMatrix(parameters.Q4);
     }
 
     void Estimator::validateOptions(Options options)
@@ -897,7 +902,7 @@ namespace Spacetime
         }
         else
         {
-            Eigen::Matrix<DTYPE, 18, 18> Qs_inv = getQsInv(ds, m_hyperparameters.Q2, m_hyperparameters.Q3, node), Qs_i = getQs(ds_i, m_hyperparameters.Q2, m_hyperparameters.Q3, node);
+            Eigen::Matrix<DTYPE, 18, 18> Qs_inv = getQsInv(ds, m_hyperparameters.Q2, m_hyperparameters.Q4, node), Qs_i = getQs(ds_i, m_hyperparameters.Q2, m_hyperparameters.Q4, node);
             Eigen::Matrix<DTYPE, 18, 18> phis_n_i, phis_i_n1, phis_n_n1;
             phis_n_i << getPhiS(s_i - s_n, node);
             phis_i_n1 << getPhiS(s_n1 - s_i, node);
@@ -958,12 +963,23 @@ namespace Spacetime
         assert((k != (unsigned int)-1) && "ERR: Query time not in estimation window.");
 
         const unsigned int max_K = state.getK(m_robot_topology);
+        const auto &node00 = state.estimation_nodes[k * m_robot_topology.N + n];
+
+        const bool at_node_space = std::abs(query_node.arclength - node00.arclength) < TOLERANCE;
+        const bool at_node_time = std::abs(query_node.time - node00.time) < TOLERANCE;
+        if (at_node_space && at_node_time)
+        {
+            query_node = node00;
+            if (compute_jac)
+            {
+                jac = Eigen::MatrixXd::Identity(18, 18);
+            }
+            return;
+        }
 
         // Avoid invalid neighbor access on degenerate grids and time/space boundaries.
         if (m_robot_topology.N <= 1 || max_K <= 1)
         {
-            const auto &node00 = state.estimation_nodes[k * m_robot_topology.N + n];
-
             if (m_robot_topology.N <= 1 && max_K <= 1)
             {
                 query_node = node00;
@@ -1012,6 +1028,20 @@ namespace Spacetime
             return;
         }
 
+        if ((n + 1) >= m_robot_topology.N)
+        {
+            const auto &node01 = state.estimation_nodes[(k + 1) * m_robot_topology.N + n];
+            interpolateMean1D(query_node, node00, node01, jac, compute_jac);
+            return;
+        }
+
+        if ((k + 1) >= max_K)
+        {
+            const auto &node10 = state.estimation_nodes[k * m_robot_topology.N + (n + 1)];
+            interpolateMean1D(query_node, node00, node10, jac, compute_jac);
+            return;
+        }
+
         const unsigned int k1 = k + 1;
         const unsigned int n1 = n + 1;
 
@@ -1032,9 +1062,7 @@ namespace Spacetime
             query_node = node00;
             if (compute_jac)
             {
-                jac.resize(18, 36);
-                jac.setZero();
-                jac.block<18, 18>(0, 0).setIdentity();
+                jac = Eigen::MatrixXd::Identity(18, 18);
             }
             return;
         }
@@ -1226,8 +1254,8 @@ namespace Spacetime
 
             jac_k_tau = m_binary_space_factor->getJacobian({node00, query_node}, e);
             jac_tau_k1 = m_binary_space_factor->getJacobian({query_node, node10}, e);
-            Q_k_tau_inv = getQsInv(query_node.arclength - node00.arclength, m_hyperparameters.Q2, m_hyperparameters.Q3, node00).cast<double>();
-            Q_tau_k1_inv = getQsInv(node10.arclength - query_node.arclength, m_hyperparameters.Q2, m_hyperparameters.Q3, node00).cast<double>();
+            Q_k_tau_inv = getQsInv(query_node.arclength - node00.arclength, m_hyperparameters.Q2, m_hyperparameters.Q4, node00).cast<double>();
+            Q_tau_k1_inv = getQsInv(node10.arclength - query_node.arclength, m_hyperparameters.Q2, m_hyperparameters.Q4, node00).cast<double>();
             covariance_square = node00.getCovarianceSquareSpace();
         }
         else
@@ -1273,10 +1301,10 @@ namespace Spacetime
             E_sigma_n1_stacked << -jac_k_sigma_n1.block<18, 18>(0, 18), Eigen::Matrix<double, 18, 18>::Zero(),
                 Eigen::Matrix<double, 18, 18>::Zero(), -jac_k1_sigma_n1.block<18, 18>(0, 18);
 
-            Q_n_sigma_inv_stacked << getQsInv(node_time_interp_t0.arclength - node00.arclength, m_hyperparameters.Q2, m_hyperparameters.Q3, node00).cast<double>(), Eigen::Matrix<double, 18, 18>::Zero(),
-                Eigen::Matrix<double, 18, 18>::Zero(), getQsInv(node_time_interp_t1.arclength - node01.arclength, m_hyperparameters.Q2, m_hyperparameters.Q3, node00).cast<double>();
-            Q_sigma_n1_inv_stacked << getQsInv(node10.arclength - node_time_interp_t0.arclength, m_hyperparameters.Q2, m_hyperparameters.Q3, node00).cast<double>(), Eigen::Matrix<double, 18, 18>::Zero(),
-                Eigen::Matrix<double, 18, 18>::Zero(), getQsInv(node11.arclength - node_time_interp_t1.arclength, m_hyperparameters.Q2, m_hyperparameters.Q3, node00).cast<double>();
+            Q_n_sigma_inv_stacked << getQsInv(node_time_interp_t0.arclength - node00.arclength, m_hyperparameters.Q2, m_hyperparameters.Q4, node00).cast<double>(), Eigen::Matrix<double, 18, 18>::Zero(),
+                Eigen::Matrix<double, 18, 18>::Zero(), getQsInv(node_time_interp_t1.arclength - node01.arclength, m_hyperparameters.Q2, m_hyperparameters.Q4, node00).cast<double>();
+            Q_sigma_n1_inv_stacked << getQsInv(node10.arclength - node_time_interp_t0.arclength, m_hyperparameters.Q2, m_hyperparameters.Q4, node00).cast<double>(), Eigen::Matrix<double, 18, 18>::Zero(),
+                Eigen::Matrix<double, 18, 18>::Zero(), getQsInv(node11.arclength - node_time_interp_t1.arclength, m_hyperparameters.Q2, m_hyperparameters.Q4, node00).cast<double>();
 
             Eigen::Matrix<double, 36, 36> Sigma;
             Sigma << (E_n_sigma_stacked.transpose() * Q_n_sigma_inv_stacked * E_n_sigma_stacked + F_sigma_n1_stacked.transpose() * Q_sigma_n1_inv_stacked * F_sigma_n1_stacked).inverse();
@@ -1601,12 +1629,14 @@ namespace Spacetime
                 DTYPE new_cost;
 
                 Eigen::VectorX<double> step;
-                double c = 0.5;
+                const double directional_derivative = -dx.dot(Eigen::VectorXd(b));
+                double c = 1e-4;
                 double tau = 0.5;
                 int ls_iter = 0;
-                int max_ls_iter = 10;
+                int max_ls_iter = 20;
+                bool step_accepted = false;
 
-                do // As long as the cost of the next step are larger than the current cost
+                while (ls_iter < max_ls_iter && std::isfinite(directional_derivative) && directional_derivative <= 0.0)
                 {
                     // Reset state_check to current state
                     state_check = results.state;
@@ -1619,22 +1649,29 @@ namespace Spacetime
 
                     // Compute the cost for the new state
                     assemblePriorTerms(A_tripletList, b_tripletList, cost_p, state_check, m_robot_topology, true);
+                    cost_m = 0.0;
 #pragma omp declare reduction(dtype_add:DTYPE : omp_out += omp_in) initializer(omp_priv = DTYPE(0.0))
 #pragma omp declare reduction(merge_triplet_list : std::vector<Eigen::Triplet<double>> : omp_out.insert(omp_out.end(), omp_in.begin(), omp_in.end())) initializer(omp_priv = std::vector<Eigen::Triplet<double>>())
 #pragma omp parallel for reduction(dtype_add : cost_m) reduction(merge_triplet_list : A_tripletList, b_tripletList)
-                    for (auto factor : m_measurement_factors)
+                    for (int measurement_index = m_start_meas_idx; measurement_index < end_meas; ++measurement_index)
                     {
-                        assembleMeasurementTerm(factor, A_tripletList, b_tripletList, cost_m, state_check, m_robot_topology, true);
+                        assembleMeasurementTerm(m_measurement_factors[measurement_index], A_tripletList, b_tripletList, cost_m, state_check, m_robot_topology, true);
                     }
                     new_cost = cost_m + cost_p;
                     debug() << "Line search: " << double(new_cost) << ", " << cost_m << ", " << cost_p;
 
-                    alpha = tau * alpha; // Half the step to make for next iteration
+                    if (std::isfinite(double(new_cost)) &&
+                        double(new_cost) <= double(cost) + c * alpha * directional_derivative)
+                    {
+                        step_accepted = true;
+                        break;
+                    }
 
+                    alpha = tau * alpha;
                     ls_iter++;
-                } while ((new_cost > (double(cost) + m * c * alpha) || std::isnan(double(new_cost))) && ls_iter < max_ls_iter);
+                }
 
-                if (new_cost < (double(cost) + m * c * alpha))
+                if (step_accepted)
                 {
                     // Set the current state to the state that minimzed the cost
                     results.state = state_check;
@@ -1643,6 +1680,57 @@ namespace Spacetime
                 {
                     if (!m_options.LM_damping)
                     {
+                        if (verbose_mode)
+                        {
+                            const double probe_alpha = 1e-4 / std::max(1.0, dx.norm());
+                            auto evaluate_probe = [&](double probe_scale)
+                            {
+                                SystemState<DTYPE> probe_state = results.state;
+                                Eigen::VectorXd probe_step = probe_scale * dx;
+                                updateStateVariables(probe_state, probe_step);
+                                Eigen::VectorXd probe_costs = Eigen::VectorXd::Zero(5);
+                                for (unsigned int node_index = 0; node_index < total_nodes; ++node_index)
+                                {
+                                    const unsigned int space_index = node_index % m_robot_topology.N;
+                                    const unsigned int time_index = node_index / m_robot_topology.N;
+                                    const auto& node = probe_state.estimation_nodes[node_index];
+                                    if (space_index == 0)
+                                    {
+                                        probe_costs(0) += double(m_unary_factor->getCost(std::vector({node})));
+                                    }
+                                    else
+                                    {
+                                        const std::vector<Node> pair = {probe_state.estimation_nodes[node_index - 1], node};
+                                        const std::vector<Node> initial_pair = {results.state.estimation_nodes[node_index - 1], results.state.estimation_nodes[node_index]};
+                                        const Eigen::VectorXd error = m_binary_space_factor->getError(pair).cast<double>();
+                                        probe_costs(1) += 0.5 * error.dot(m_binary_space_factor->getWeight(pair).cast<double>() * error);
+                                        probe_costs(4) += 0.5 * error.dot(m_binary_space_factor->getWeight(initial_pair).cast<double>() * error);
+                                    }
+                                    if (time_index > 0 && !m_robot_topology.use_1D_estimator)
+                                    {
+                                        const std::vector<Node> pair = {probe_state.estimation_nodes[node_index - m_robot_topology.N], node};
+                                        const Eigen::VectorXd error = m_binary_time_factor->getError(pair).cast<double>();
+                                        probe_costs(2) += 0.5 * error.dot(m_binary_time_factor->getWeight(pair).cast<double>() * error);
+                                    }
+                                }
+                                DTYPE measurement_cost = 0.0;
+                                for (int measurement_index = m_start_meas_idx; measurement_index < end_meas; ++measurement_index)
+                                {
+                                    assembleMeasurementTerm(m_measurement_factors[measurement_index], A_tripletList, b_tripletList, measurement_cost, probe_state, m_robot_topology, true);
+                                }
+                                probe_costs(3) = double(measurement_cost);
+                                return probe_costs;
+                            };
+                            const Eigen::VectorXd plus_costs = evaluate_probe(probe_alpha);
+                            const Eigen::VectorXd minus_costs = evaluate_probe(-probe_alpha);
+                            const Eigen::VectorXd slopes = (plus_costs - minus_costs) / (2.0 * probe_alpha);
+                            warning() << "Line search directional check: predicted=" << directional_derivative
+                                      << ", actual=" << slopes.head(4).sum()
+                                      << ", unary=" << slopes(0) << ", space=" << slopes(1)
+                                      << ", time=" << slopes(2) << ", measurements=" << slopes(3)
+                                      << ", frozen_space=" << slopes(4)
+                                      << ", frozen_total=" << slopes(0) + slopes(4) + slopes(2) + slopes(3);
+                        }
                         results.message << "Line search failed.";
                         return results;
                     }
@@ -2061,6 +2149,17 @@ namespace Spacetime
                 nodes_int.push_back((int)ri);
             factor_node_indices.push_back(nodes_int);
 
+            const int expected_local_dimension = static_cast<int>(row_indices.size()) * 18;
+            if (A_block.rows() != expected_local_dimension || A_block.cols() != expected_local_dimension)
+            {
+                throw std::runtime_error(
+                    "extractJacobianHessian: interpolation Jacobian support mismatch at t=" +
+                    std::to_string(measurement.t) + ", s=" + std::to_string(measurement.s) +
+                    ": Hessian block is " + std::to_string(A_block.rows()) + "x" +
+                    std::to_string(A_block.cols()) + " but " + std::to_string(row_indices.size()) +
+                    " support nodes provide dimension " + std::to_string(expected_local_dimension) + ".");
+            }
+
             // write triplets
             for (int row_block = 0; row_block < (int)A_block.rows(); row_block++)
             {
@@ -2078,6 +2177,18 @@ namespace Spacetime
         std::cout << "Number of nodes: " << total_nodes << std::endl;
         // Build sparse H
         int size = 18 * total_nodes;
+        for (const auto& triplet : A_tripletList)
+        {
+            if (triplet.row() < 0 || triplet.row() >= size ||
+                triplet.col() < 0 || triplet.col() >= size ||
+                !std::isfinite(triplet.value()))
+            {
+                throw std::runtime_error(
+                    "extractJacobianHessian: invalid Hessian triplet at (" +
+                    std::to_string(triplet.row()) + ", " + std::to_string(triplet.col()) +
+                    ") for matrix size " + std::to_string(size) + ".");
+            }
+        }
         H.resize(size, size);
         H.setFromTriplets(A_tripletList.begin(), A_tripletList.end());
         std::cout << "Hessian size: " << H.rows() << " x " << H.cols() << std::endl;

@@ -18,5 +18,12 @@
         "gyro": true, 
         "start_time": 19,
         "end_time": 29
+    },
+    "options": {
+        "estimator": "batch",
+        "prior_only_ground_truth_mode": false,
+        "physical_window_duration": 2,
+        "measurement_sample_count": 9,
+        "exclude_base_measurements": false
     }
 }

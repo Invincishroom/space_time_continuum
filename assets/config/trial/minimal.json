@@ -15,21 +15,21 @@
     "data": {
         "folder_path": "assets/data/minimal/",
         "aurora": true,
-        "velocity": false,
-        "gyro": false,
-        "lidar": false,
-        "fbgs": false,
+        "velocity": true,
+        "gyro": true,
+        "lidar": true,
+        "fbgs": true,
         "start_time": 0,
-        "end_time": 3
+        "end_time": 0.033
     },
     "options": {
         "estimator": "batch",
         "interpolate_measurements": true,
         "compute_covariances": false,
         "extract_from_front": false,
-        "validation_interval": 1,
         "prior_only_ground_truth_mode": true,
-        "validation_sample_count": 300,
-        "validation_rng_seed": 7 // Original seed is 7
+        "validation_sample_count": 10,
+        "validation_rng_seed": 7,
+        "measurement_rng_seed": 17
     }
 }

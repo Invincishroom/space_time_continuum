@@ -15,7 +15,8 @@ namespace Spacetime::Factors
     class BinarySpaceFactor : public Factor
     {
     public:
-        BinarySpaceFactor(Eigen::Matrix<double, 6, 6> Q2, Eigen::Matrix<double, 6, 6> Q3) : Factor(), m_Q2(Q2), m_Q3(Q3) {}
+        BinarySpaceFactor(Eigen::Matrix<double, 6, 6> Q2, Eigen::Matrix<double, 6, 6> Q4)
+            : Factor(), m_Q2_inv(Q2.inverse()), m_Q4_inv(Q4.inverse()) {}
         ~BinarySpaceFactor() = default;
 
         Eigen::VectorX<DTYPE> getError(const std::vector<Node> &nodes) const override
@@ -25,8 +26,7 @@ namespace Spacetime::Factors
             double ds = nodes[1].arclength - nodes[0].arclength;
             Eigen::Matrix<DTYPE, 6, 1> xi = se3::tran2vec(nodes[1].pose * invertTransformation(nodes[0].pose));
 
-            // Eigen::Matrix<DTYPE, 6, 1> e2 = nodes[1].varpi - nodes[0].varpi;
-            Eigen::Matrix<DTYPE, 6, 1> e2 = nodes[1].varpi - nodes[0].varpi - ds * se3::curlyhat(nodes[0].epsilon) * nodes[0].varpi;
+            Eigen::Matrix<DTYPE, 6, 1> e2 = nodes[1].varpi - nodes[0].varpi + se3::curlyhat(nodes[0].varpi) * xi;
             Eigen::Matrix<DTYPE, 6, 1> e4 = nodes[1].epsilon - nodes[0].epsilon;
             Eigen::Matrix<DTYPE, 6, 1> e6 = xi - ds * nodes[0].epsilon;
 
@@ -53,25 +53,13 @@ namespace Spacetime::Factors
         Eigen::Matrix<DTYPE, 18, 18> getWeight(const std::vector<Node> &nodes) const
         {
             double ds = nodes[1].arclength - nodes[0].arclength;
-            const DTYPE ds2 = ds * ds / 2.0;
-            const DTYPE ds3 = ds * ds * ds / 3.0;
-
-            Eigen::Matrix<DTYPE, 18, 18> Qs;
-            // Qs << ds3 * m_Q2, ds2 * m_Q2, ZERO<DTYPE>(6),
-            //     ds2 * m_Q2, ds * m_Q2, ZERO<DTYPE>(6),
-            //     ZERO<DTYPE>(6), ZERO<DTYPE>(6), ds * m_Q3;
-
-            Eigen::Matrix<DTYPE, 6, 6> varpihat = se3::curlyhat(nodes[0].varpi);
-            Qs << ds3 * m_Q2,
-                ds2 * m_Q2,
-                -ds3 * m_Q2 * varpihat.transpose(),
-                ds2 * m_Q2,
-                ds * m_Q2,
-                -ds2 * m_Q2 * varpihat.transpose(),
-                -ds3 * varpihat * m_Q2,
-                -ds2 * varpihat * m_Q2,
-                ds * m_Q3 + ds3 * varpihat * m_Q2 * varpihat.transpose();
-            return Qs.inverse();
+            Eigen::Matrix<DTYPE, 18, 18> weight = Eigen::Matrix<DTYPE, 18, 18>::Zero();
+            weight.template block<6, 6>(0, 0) = (12.0 / (ds * ds * ds)) * m_Q2_inv.template cast<DTYPE>();
+            weight.template block<6, 6>(0, 6) = (-6.0 / (ds * ds)) * m_Q2_inv.template cast<DTYPE>();
+            weight.template block<6, 6>(6, 0) = weight.template block<6, 6>(0, 6);
+            weight.template block<6, 6>(6, 6) = (4.0 / ds) * m_Q2_inv.template cast<DTYPE>();
+            weight.template block<6, 6>(12, 12) = (1.0 / ds) * m_Q4_inv.template cast<DTYPE>();
+            return weight;
         }
 
         Eigen::MatrixX<double> getJacobian(const std::vector<Node> &nodes, Eigen::VectorX<DTYPE> &e) const override
@@ -85,21 +73,19 @@ namespace Spacetime::Factors
             Eigen::Matrix<double, 4, 4> tran = node1.pose * invertTransformation(node0.pose);
             Eigen::Matrix<double, 6, 1> xi = se3::tran2vec(tran);
 
-            // compute e
-            e = getError(nodes); // 5% slower, keep only for debug
+            e = getError(nodes);
 
-            // Compute Jacobian
+            const Eigen::Matrix<double, 6, 6> pose_jacobian0 = -se3::vec2jacinv(xi) * se3::tranAd(tran);
+            const Eigen::Matrix<double, 6, 6> pose_jacobian1 = se3::vec2jacinv(xi);
+            const Eigen::Matrix<double, 6, 6> varpihat = se3::curlyhat(node0.varpi);
             Eigen::Matrix<double, 18, 18> dedx0, dedx1;
-            dedx0 << -se3::vec2jacinv(xi) * se3::tranAd(tran), -ds * EYE(6), ZERO(6),                  // e2
-                ZERO(6), -EYE(6), ZERO(6),                                                             // e4
-                ZERO(6), ds * se3::curlyhat(node0.varpi), -EYE(6) - ds * se3::curlyhat(node0.epsilon); // e6
-            // dedx0 << -se3::vec2jacinv(xi) * se3::tranAd(tran), -ds * EYE(6), ZERO(6),                  // e2
-            //     ZERO(6), -EYE(6), ZERO(6),                                                             // e4
-            //     ZERO(6), ZERO(6), -EYE(6); // e6
+            dedx0 << pose_jacobian0, -ds * EYE(6), ZERO(6),
+                ZERO(6), -EYE(6), ZERO(6),
+                varpihat * pose_jacobian0, ZERO(6), -EYE(6) - se3::curlyhat(xi);
 
-            dedx1 << se3::vec2jacinv(xi), ZERO(6), ZERO(6),
-                ZERO(6), EYE(6), ZERO(6), // e4
-                ZERO(6), ZERO(6), EYE(6); // e2; // e6
+            dedx1 << pose_jacobian1, ZERO(6), ZERO(6),
+                ZERO(6), EYE(6), ZERO(6),
+                varpihat * pose_jacobian1, ZERO(6), EYE(6);
 
             // Assemble terms into correct spot in matrix
             Eigen::Matrix<double, 18, 36> H;
@@ -109,7 +95,7 @@ namespace Spacetime::Factors
         };
 
     private:
-        const Eigen::Matrix<double, 6, 6> m_Q2, m_Q3;
+        const Eigen::Matrix<double, 6, 6> m_Q2_inv, m_Q4_inv;
     };
 }
 #endif // BINARYSPACEFACTOR_H
